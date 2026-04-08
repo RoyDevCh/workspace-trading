@@ -1,0 +1,37 @@
+{
+  "ok": true,
+  "mode": "simulation",
+  "run_id": "simulation_20260407T100958Z",
+  "strategy_id": "openclaw_one_shot_buy_bridge_detached",
+  "template_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\templates\\gm_one_shot_order_template.py",
+  "script_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T100958Z\\strategy.py",
+  "stdout_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T100958Z\\stdout.log",
+  "stderr_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T100958Z\\stderr.log",
+  "metrics_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T100958Z\\metrics.json",
+  "state_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\openclawtest_bridge_detached_state.json",
+  "pid_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\openclawtest_bridge_detached_state.pid",
+  "pid": 687692,
+  "params": {
+    "account_id": "openclawtest",
+    "symbol": "SHSE.510300",
+    "frequency": "1d",
+    "fast_period": 5,
+    "slow_period": 20,
+    "order_volume": 100,
+    "rebalance_time": "14:50:00",
+    "side": "buy",
+    "order_type": "market"
+  },
+  "started_at": "2026-04-07T10:09:58.118219+00:00",
+  "running": false,
+  "stopped_at": "2026-04-07T18:15:04.308611+08:00",
+  "last_stop_result": {
+    "ok": true,
+    "pid": 687692,
+    "stopped": true,
+    "already_stopped": false,
+    "returncode": 0,
+    "stdout": "成功: 已终止 PID 799784 (属于 PID 687692 子进程)的进程。\n成功: 已终止 PID 799000 (属于 PID 687692 子进程)的进程。\n成功: 已终止 PID 687692 (属于 PID 687576 子进程)的进程。\n",
+    "stderr": ""
+  }
+}

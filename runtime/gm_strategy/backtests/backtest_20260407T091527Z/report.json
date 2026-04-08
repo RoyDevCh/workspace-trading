@@ -1,0 +1,51 @@
+{
+  "ok": true,
+  "mode": "backtest",
+  "run_id": "backtest_20260407T091527Z",
+  "strategy_id": "openclaw_gm_env_smoke",
+  "template_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\templates\\gm_ma_cross_template.py",
+  "script_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\backtests\\backtest_20260407T091527Z\\strategy.py",
+  "metrics_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\backtests\\backtest_20260407T091527Z\\metrics.json",
+  "stdout_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\backtests\\backtest_20260407T091527Z\\stdout.log",
+  "stderr_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\backtests\\backtest_20260407T091527Z\\stderr.log",
+  "returncode": 0,
+  "timed_out": false,
+  "metrics": {
+    "account_id": "openclaw_gm_env_smoke",
+    "pnl_ratio": 3.079763184394688e-05,
+    "pnl_ratio_annual": 0.00012630489464090573,
+    "sharp_ratio": 0.7081547227175519,
+    "max_drawdown": 5.4997019997416695e-05,
+    "risk_ratio": 0.0010121012909896558,
+    "open_count": 1,
+    "calmar_ratio": 2.2965770626633675,
+    "created_at": "datetime.datetime(2026, 4, 7, 17, 15, 28, 21127, tzinfo=datetime.timezone(datetime.timedelta(seconds=28800), 'Asia/Shanghai'))",
+    "updated_at": "datetime.datetime(2026, 4, 7, 17, 15, 28, 145267, tzinfo=datetime.timezone(datetime.timedelta(seconds=28800), 'Asia/Shanghai'))",
+    "close_count": 0,
+    "win_count": 0,
+    "lose_count": 0,
+    "win_ratio": 0.0
+  },
+  "params": {
+    "account_id": "openclaw",
+    "symbol": "SHSE.600000",
+    "frequency": "1d",
+    "fast_period": 5,
+    "slow_period": 20,
+    "order_volume": 100,
+    "rebalance_time": "14:50:00"
+  },
+  "backtest": {
+    "timeout_sec": 300,
+    "start_time": "2025-01-02 09:30:00",
+    "end_time": "2025-03-31 15:00:00",
+    "initial_cash": 1000000,
+    "transaction_ratio": 1,
+    "commission_ratio": 0.0001,
+    "slippage_ratio": 0.0001,
+    "adjust": 0,
+    "check_cache": 1,
+    "match_mode": 0,
+    "intraday": 0
+  }
+}

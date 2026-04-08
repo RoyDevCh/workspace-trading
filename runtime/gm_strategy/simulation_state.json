@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "mode": "simulation",
+  "run_id": "simulation_20260407T091545Z",
+  "strategy_id": "openclaw_gm_env_sim",
+  "template_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\templates\\gm_ma_cross_template.py",
+  "script_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T091545Z\\strategy.py",
+  "stdout_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T091545Z\\stdout.log",
+  "stderr_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T091545Z\\stderr.log",
+  "metrics_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T091545Z\\metrics.json",
+  "state_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation_state.json",
+  "pid_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation_state.pid",
+  "pid": 556720,
+  "params": {
+    "account_id": "openclaw",
+    "symbol": "SHSE.600000",
+    "frequency": "1d",
+    "fast_period": 5,
+    "slow_period": 20,
+    "order_volume": 100,
+    "rebalance_time": "14:50:00"
+  },
+  "started_at": "2026-04-07T09:15:45.437005+00:00",
+  "running": false,
+  "stopped_at": "2026-04-07T17:16:20.692435+08:00",
+  "last_stop_result": {
+    "ok": true,
+    "pid": 556720,
+    "stopped": true,
+    "already_stopped": true,
+    "returncode": 128,
+    "stdout": "",
+    "stderr": "错误: 没有找到进程 \"556720\"。\n"
+  }
+}

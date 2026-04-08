@@ -1,0 +1,29 @@
+{
+  "ok": true,
+  "mode": "backtest",
+  "run_id": "backtest_20260407T090349Z",
+  "strategy_id": "openclaw_gm_bridge_smoke",
+  "template_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\templates\\gm_ma_cross_template.py",
+  "script_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\backtests\\backtest_20260407T090349Z\\strategy.py",
+  "metrics_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\backtests\\backtest_20260407T090349Z\\metrics.json",
+  "stdout_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\backtests\\backtest_20260407T090349Z\\stdout.log",
+  "stderr_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\backtests\\backtest_20260407T090349Z\\stderr.log",
+  "returncode": 0,
+  "timed_out": false,
+  "metrics": null,
+  "params": {
+    "symbol": "SHSE.600000",
+    "frequency": "1d",
+    "fast_period": 5,
+    "slow_period": 20,
+    "order_volume": 100,
+    "rebalance_time": "14:50:00"
+  },
+  "backtest": {
+    "start_time": "2025-01-02 09:30:00",
+    "end_time": "2025-03-31 15:00:00",
+    "initial_cash": 1000000,
+    "commission_ratio": 0.0001,
+    "slippage_ratio": 0.0001
+  }
+}

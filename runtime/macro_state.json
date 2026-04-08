@@ -1,0 +1,47 @@
+{
+  "updated_at": "2026-04-08T11:44:59.534511+08:00",
+  "preferred_market": "cn_equity",
+  "risk_mode": "defensive",
+  "risk_regime": "defensive",
+  "position_scale_overrides": {
+    "cn_equity": 0.5,
+    "crypto": 1.0
+  },
+  "benchmarks": {
+    "cn_equity": "510300",
+    "crypto": "BTC/USDT"
+  },
+  "markets": {
+    "cn_equity": {
+      "symbol": "510300",
+      "market": "cn_equity",
+      "source": "yfinance",
+      "interval": "1d",
+      "close": 4.453999996185303,
+      "change_5": -0.011978682797612605,
+      "change_20": -0.04563956054554996,
+      "realized_volatility": 0.17987762608726685,
+      "rolling_volatility": 0.011331225358370776,
+      "volatility_percentile": 0.95,
+      "stability_score": -0.2255171866328168,
+      "count": 120
+    },
+    "crypto": {
+      "symbol": "BTC/USDT",
+      "market": "crypto",
+      "source": "ccxt",
+      "interval": "1d",
+      "close": 68119.77,
+      "change_5": 0.01820229589548905,
+      "change_20": 0.01820229589548905,
+      "realized_volatility": 0.2855346710370634,
+      "rolling_volatility": 0.014945567754972602,
+      "volatility_percentile": 0.5,
+      "stability_score": -0.2673323751415744,
+      "count": 7
+    }
+  },
+  "notes": [
+    "CN equity volatility percentile 0.95 is above the 0.80 threshold."
+  ]
+}

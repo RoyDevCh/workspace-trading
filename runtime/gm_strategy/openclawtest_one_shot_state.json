@@ -1,0 +1,26 @@
+{
+  "ok": true,
+  "mode": "simulation",
+  "run_id": "simulation_20260407T100524Z",
+  "strategy_id": "openclaw_one_shot_buy_bgfix",
+  "template_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\templates\\gm_one_shot_order_template.py",
+  "script_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T100524Z\\strategy.py",
+  "stdout_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T100524Z\\stdout.log",
+  "stderr_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T100524Z\\stderr.log",
+  "metrics_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T100524Z\\metrics.json",
+  "state_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\openclawtest_one_shot_state.json",
+  "pid_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\openclawtest_one_shot_state.pid",
+  "pid": 673524,
+  "params": {
+    "account_id": "openclawtest",
+    "symbol": "SHSE.510300",
+    "frequency": "1d",
+    "fast_period": 5,
+    "slow_period": 20,
+    "order_volume": 100,
+    "rebalance_time": "14:50:00",
+    "side": "buy",
+    "order_type": "market"
+  },
+  "started_at": "2026-04-07T10:05:24.275665+00:00"
+}

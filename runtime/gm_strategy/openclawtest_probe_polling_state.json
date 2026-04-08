@@ -1,0 +1,37 @@
+{
+  "ok": true,
+  "mode": "simulation",
+  "run_id": "simulation_20260407T103504102777Z",
+  "strategy_id": "openclaw_account_probe_polling",
+  "template_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\templates\\gm_account_probe_template.py",
+  "script_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T103504102777Z\\strategy.py",
+  "stdout_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T103504102777Z\\stdout.log",
+  "stderr_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T103504102777Z\\stderr.log",
+  "metrics_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T103504102777Z\\metrics.json",
+  "state_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\openclawtest_probe_polling_state.json",
+  "pid_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\openclawtest_probe_polling_state.pid",
+  "pid": 862264,
+  "params": {
+    "account_id": "openclawtest",
+    "symbol": "SHSE.510300",
+    "frequency": "1d",
+    "fast_period": 5,
+    "slow_period": 20,
+    "order_volume": 100,
+    "rebalance_time": "14:50:00",
+    "poll_attempts": 12,
+    "poll_interval_sec": 5
+  },
+  "started_at": "2026-04-07T10:35:04.113325+00:00",
+  "running": false,
+  "stopped_at": "2026-04-07T18:46:02.040652+08:00",
+  "last_stop_result": {
+    "ok": true,
+    "pid": 862264,
+    "stopped": true,
+    "already_stopped": false,
+    "returncode": 0,
+    "stdout": "成功: 已终止 PID 727064 (属于 PID 862264 子进程)的进程。\n成功: 已终止 PID 751100 (属于 PID 862264 子进程)的进程。\n成功: 已终止 PID 862264 (属于 PID 863224 子进程)的进程。\n",
+    "stderr": ""
+  }
+}

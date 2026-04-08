@@ -1,0 +1,26 @@
+{
+  "ok": true,
+  "mode": "simulation",
+  "run_id": "simulation_20260407T104601667438Z",
+  "strategy_id": "openclawtest_probe_real_id",
+  "template_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\templates\\gm_account_probe_template.py",
+  "script_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T104601667438Z\\strategy.py",
+  "stdout_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T104601667438Z\\stdout.log",
+  "stderr_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T104601667438Z\\stderr.log",
+  "metrics_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\simulation\\simulation_20260407T104601667438Z\\metrics.json",
+  "state_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\openclawtest_probe_real_id_state.json",
+  "pid_path": "C:\\Users\\Roy\\.openclaw\\workspace-trading\\runtime\\gm_strategy\\openclawtest_probe_real_id_state.pid",
+  "pid": 784280,
+  "params": {
+    "account_id": "d5c65e4a-3265-11f1-ab23-00163e022aa6",
+    "symbol": "SHSE.510300",
+    "frequency": "1d",
+    "fast_period": 5,
+    "slow_period": 20,
+    "order_volume": 100,
+    "rebalance_time": "14:50:00",
+    "poll_attempts": 6,
+    "poll_interval_sec": 3
+  },
+  "started_at": "2026-04-07T10:46:01.677490+00:00"
+}
