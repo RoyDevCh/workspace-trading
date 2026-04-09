@@ -350,9 +350,19 @@ Hourly discovery and nightly optimization still use the split OpenClaw cron jobs
 
 Do not write secrets into repo files (Binance API keys, webhook secrets, broker credentials).
 
+**密钥备份文件**: `SECRETS_BACKUP.md`（本地存储所有密钥原文，已加入 `.gitignore`，不会提交到 Git）
+
 Secrets are stored in:
 - `C:\Users\Roy\.openclaw\config.yaml` — All execution API keys (DO NOT commit)
 - `C:\Users\Roy\.openclaw\.env` — Legacy environment variables (spot testnet keys)
+- `C:\Users\Roy\.openclaw\openclaw.json` — Discord bot token, OpenRouter API key, Feishu token
+
+代码中的密钥引用方式：
+- `discord_agent_bridge.py`: 从 `DISCORD_BOT_TOKEN` 和 `DISCORD_CHANNEL_ID` 环境变量读取
+- `execution.py`: API key/secret 从 `config.yaml` 读取
+- GM Token: 通过 `GM_TOKEN` / `GMTRADE_TOKEN` 环境变量或 `config.yaml` 的 `execution.gmtrade.token` 读取
+
+⚠️ **安全提醒**: 所有密钥曾暴露于 GitHub 历史（已于 2026-04-09 清理），建议轮换所有 API Key。
 
 ### 8.2 Proxies
 

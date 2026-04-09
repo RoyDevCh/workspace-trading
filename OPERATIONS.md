@@ -64,6 +64,7 @@ Current operator channel:
 - Feishu has been removed from the active trading runtime.
 - Operator notifications and chat control now go through Discord only.
 - Bot: `openclaw-bot#2977`
+- Bot Token & Channel ID: 见 `SECRETS_BACKUP.md`（环境变量 `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`）
 - Bridge: `discord_agent_bridge.py` with auto-restart daemon
 - Proxy: `127.0.0.1:7897`
 
@@ -150,6 +151,8 @@ Mixed-port: `7897`
 
 ### config.yaml structure
 
+> 🔐 完整密钥值见本地 `SECRETS_BACKUP.md`（已加入 .gitignore，不会提交到 Git）
+
 ```yaml
 execution:
   default: ccxt
@@ -160,23 +163,23 @@ execution:
   ccxt:
     exchange: binance
     testnet: true
-    api_key: <spot testnet key>
-    secret: <spot testnet secret>
+    api_key: <见 SECRETS_BACKUP.md - Binance Spot Testnet>
+    secret: <见 SECRETS_BACKUP.md - Binance Spot Testnet>
   futures:
     exchange: binance
     testnet: true
-    api_key: <futures testnet key>
-    secret: <futures testnet secret>
+    api_key: <见 SECRETS_BACKUP.md - Binance Futures Testnet>
+    secret: <见 SECRETS_BACKUP.md - Binance Futures Testnet>
     quote_asset: USDT
   gmtrade:
-    token: <GM token>
-    account_id: <UUID>
+    token: <见 SECRETS_BACKUP.md - GM Token>
+    account_id: e1255940-325a-11f1-ab23-00163e022aa6
     endpoint: api.myquant.cn:9000
     lot_size: 100
   gm_strategy:
     python_executable: C:/Users/Roy/.openclaw/runtime/gm311/Scripts/python.exe
-    token: <GM token>
-    account_id: <UUID>
+    token: <见 SECRETS_BACKUP.md - GM Token>
+    account_id: e1255940-325a-11f1-ab23-00163e022aa6
 ```
 
 ### Data source configuration

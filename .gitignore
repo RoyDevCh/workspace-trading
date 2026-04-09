@@ -2,6 +2,7 @@
 config.yaml
 openclaw.json
 execution_config.yaml
+SECRETS_BACKUP.md
 
 # Logs and runtime state
 logs/
