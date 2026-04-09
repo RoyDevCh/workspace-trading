@@ -1,0 +1,12 @@
+# OpenClaw 主项目依赖
+# 所有子模块依赖已独立管理，这里仅声明Python版本
+
+python>=3.9,<3.13
+
+# 各模块依赖独立管理:
+# - sensory/requirements.txt      (数据获取)
+# - execution/requirements.txt    (交易执行)
+# - gatekeeper/requirements.txt   (风控闸门)
+
+# 可选: 运行主程序所需
+pyyaml>=6.0

@@ -10,6 +10,12 @@ Use these local rules when calling trading tools:
 - Keep `include_zero_positions=false` unless the operator explicitly asks for every empty asset bucket.
 - The current spot environment is Binance spot testnet. Do not answer spot-balance questions as if they refer to Hyperliquid.
 - If the tool returns `tracked_positions`, summarize those first instead of dumping unrelated synthetic testnet assets.
+- For A-shares, `get_portfolio_snapshot` now resolves balances and holdings through the scripted GM account probe path instead of the old synchronous `gmtrade` executor, so it should keep working even when only `gm.api` is installed.
+
+- `probe_gm_account`
+- Use it when you want the raw MyQuant scripted account probe response, including the saved stdout/stderr/report paths under `workspace-trading/runtime/gm_strategy/live_once/`.
+- Prefer a real UUID `account_id`; aliases may still connect but return empty account state.
+- It is the fastest way to verify whether the GM runtime can see cash, positions, and order snapshots before you debug a larger A-share review loop.
 
 - `get_market_data`
 - Default scope is only `BTC/USDT` and `ETH/USDT`.
@@ -33,11 +39,13 @@ Use these local rules when calling trading tools:
 - `get_review_universe`
 - Call it once per wake-up after refreshing stale macro state.
 - It returns the exact symbols, markets, timeframes, lookbacks, and execution permissions for the current review cycle.
+- Pass `market=crypto` or `market=cn_equity` when you are running a split-lane scheduled job so the tool only returns that lane's universe.
 - For A-shares, inspect `market_session` and `execution_block_reason` when `execution_allowed=false`; that usually means weekend, midday break, holiday, or after-close, not a tool failure.
 - If `execution_allowed=false`, you may still analyze and summarize the symbol, but you must not place a real order for it in the scheduled loop.
 
 - `discover_assets`
 - Call it in the hourly discovery run, not inside every 5-minute review.
+- Pass `market=crypto` or `market=cn_equity` when discovery is running as a dedicated market lane.
 - It scans spot crypto and China A-shares, adds new dynamic symbols into `trading_rules.yaml`, and returns what changed.
 - Newly discovered symbols inherit conservative default strategies and smaller initial position scales.
 - It may also trim excess non-core symbols when the configured universe cap is exceeded.
@@ -93,6 +101,7 @@ Use these local rules when calling trading tools:
 
 - `optimize_strategy`
 - Use it for the nightly self-optimization pass, not inside every 5-minute wake-up.
+- Pass `market=crypto` or `market=cn_equity` when nightly maintenance is running in a dedicated market lane.
 - It may update per-symbol order sizes after enough executed-trade evidence exists.
 - If `optimizer_mode=gm_strategy` or both `template_file` and `param_grid` are provided, it switches into the scripted MyQuant grid-search path.
 - It must preserve the symbol's assigned strategy family unless the operator explicitly changes `trading_rules.yaml`.
@@ -116,4 +125,5 @@ Use these local rules when calling trading tools:
 ## Operator Notes
 
 - When an operator wants to trigger a manual run from the remote host, prefer the helper scripts in `tools/` so the run goes through the same `isolated` cron path as production scheduling.
-- Do not rely on a long-lived `agent:trading:main` conversation for repeated manual reviews when an isolated run will achieve the same goal with less context bloat.
+- Use the market-specific helper when you want only one lane (`run_crypto_review_now.cmd`, `run_cn_equity_review_now.cmd`, and the matching discovery / optimization scripts).
+- Do not rely on a long-lived trading conversation for repeated manual reviews when an isolated run will achieve the same goal with less context bloat.
