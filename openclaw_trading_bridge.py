@@ -55,6 +55,14 @@ from gatekeeper.gatekeeper import (
 )
 from sensory import create_data_manager
 
+# Kernel pure-function imports (extracted 2026-04-09)
+from kernel.strategy import evaluate_signal as kernel_evaluate_signal
+from kernel.strategy.registry import (
+    evaluate_trend_following_signal as kernel_evaluate_trend_following_signal,
+    evaluate_mean_reversion_signal as kernel_evaluate_mean_reversion_signal,
+    evaluate_combined_signal as kernel_evaluate_combined_signal,
+)
+
 
 class TradingBridgeError(RuntimeError):
     pass
@@ -3177,119 +3185,18 @@ def action_calculate_indicator(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "indicator": indicator, "indicators": result}
 
 
-def evaluate_trend_following_signal(
-    strategy_cfg: Dict[str, Any],
-    indicators: Dict[str, Any],
-    quantity: float | str,
-    scale: float,
-    df: pd.DataFrame | None = None,
-    higher_tf_df: pd.DataFrame | None = None,
-    market: str = "",
-) -> tuple[str, str, float | str]:
-    fast_prev = float(indicators["ema_fast_prev"])
-    fast_now = float(indicators["ema_fast"])
-    slow_prev = float(indicators["ema_slow_prev"])
-    slow_now = float(indicators["ema_slow"])
-    rsi_value = float(indicators["rsi"]) if indicators.get("rsi") is not None else 50.0
-    buy_rsi_below = float(strategy_cfg.get("buy_rsi_below", 70))
-    sell_rsi_above = float(strategy_cfg.get("sell_rsi_above", 85))
-    golden_cross = fast_prev <= slow_prev and fast_now > slow_now
-    death_cross = fast_prev >= slow_prev and fast_now < slow_now
-    higher_trend_ok = True
-    higher_tf_ema = None
-    use_higher_tf_filter = market == "cn_equity" and bool(strategy_cfg.get("use_higher_timeframe_filter", False))
-    higher_tf_period = max(int(strategy_cfg.get("higher_timeframe_ema_period", 13) or 13), 1)
 
-    if use_higher_tf_filter and higher_tf_df is not None and not higher_tf_df.empty and len(higher_tf_df) >= higher_tf_period:
-        higher_close = pd.to_numeric(higher_tf_df["close"], errors="coerce")
-        higher_ema_series = higher_close.ewm(span=higher_tf_period, adjust=False).mean()
-        higher_tf_ema = float(higher_ema_series.iloc[-1])
-        higher_trend_ok = float(higher_close.iloc[-1]) > higher_tf_ema
-
-    indicators["higher_trend_ok"] = higher_trend_ok
-    indicators["higher_tf_ema"] = higher_tf_ema
-
-    if golden_cross and rsi_value < buy_rsi_below and higher_trend_ok:
-        if float(quantity) <= 0:
-            return (
-                "hold",
-                f"Trend-following buy signal fired but scaled quantity rounded to zero after macro position scale {scale:.2f}",
-                quantity,
-            )
-        return (
-            "buy",
-            f"Trend-following entry: EMA{strategy_cfg['ema_fast_period']} crossed above EMA{strategy_cfg['ema_slow_period']}, RSI {rsi_value:.2f} < {buy_rsi_below:.2f}, higher timeframe aligned",
-            quantity,
-        )
-    if death_cross or rsi_value > sell_rsi_above:
-        if strategy_cfg.get("sell_all_on_exit", True):
-            quantity = "ALL"
-        return (
-            "sell",
-            f"Trend-following exit: death_cross={death_cross} or RSI {rsi_value:.2f} > {sell_rsi_above:.2f}",
-            quantity,
-        )
-    return (
-        "hold",
-        f"No configured rule fired; EMA{strategy_cfg['ema_fast_period']}={indicators['ema_fast']:.2f}, EMA{strategy_cfg['ema_slow_period']}={indicators['ema_slow']:.2f}, RSI {rsi_value:.2f}, higher timeframe ok={higher_trend_ok}",
-        quantity,
-    )
+# evaluate_trend_following_signal: moved to kernel/strategy/trend_following.py
+# evaluate_mean_reversion_signal: moved to kernel/strategy/mean_reversion.py
+# evaluate_combined_signal: moved to kernel/strategy/combined.py
+# All three are now called via kernel_evaluate_signal() from kernel/strategy/registry.py
 
 
-def evaluate_mean_reversion_signal(
-    strategy_cfg: Dict[str, Any],
-    indicators: Dict[str, Any],
-    quantity: float | str,
-    scale: float,
-) -> tuple[str, str, float | str]:
-    close = float(indicators["close"])
-    rsi_value = float(indicators["rsi"]) if indicators.get("rsi") is not None else 50.0
-    bb_lower = safe_float(indicators.get("bb_lower"))
-    bb_upper = safe_float(indicators.get("bb_upper"))
-    bb_middle = safe_float(indicators.get("bb_middle"))
-    if bb_lower is None or bb_upper is None or bb_middle is None:
-        return ("hold", "Mean-reversion signal skipped because Bollinger bands are incomplete", quantity)
 
-    buy_rsi_below = float(strategy_cfg.get("buy_rsi_below", 38))
-    sell_rsi_above = float(strategy_cfg.get("sell_rsi_above", 68))
-    midline_exit_rsi_above = float(strategy_cfg.get("midline_exit_rsi_above", 52))
-    touched_lower = close <= bb_lower
-    touched_upper = close >= bb_upper
-    crossed_midline = bool(strategy_cfg.get("exit_on_midline", True)) and close >= bb_middle
 
-    if touched_lower and rsi_value <= buy_rsi_below:
-        if float(quantity) <= 0:
-            return (
-                "hold",
-                f"Mean-reversion buy signal fired but scaled quantity rounded to zero after macro position scale {scale:.2f}",
-                quantity,
-            )
-        return (
-            "buy",
-            f"Mean-reversion entry: close {close:.2f} touched lower band {bb_lower:.2f} and RSI {rsi_value:.2f} <= {buy_rsi_below:.2f}",
-            quantity,
-        )
-    if touched_upper and rsi_value >= sell_rsi_above:
-        if strategy_cfg.get("sell_all_on_exit", True):
-            quantity = "ALL"
-        return (
-            "sell",
-            f"Mean-reversion exit: close {close:.2f} reached upper band {bb_upper:.2f} and RSI {rsi_value:.2f} >= {sell_rsi_above:.2f}",
-            quantity,
-        )
-    if crossed_midline and rsi_value >= midline_exit_rsi_above:
-        if strategy_cfg.get("sell_all_on_exit", True):
-            quantity = "ALL"
-        return (
-            "sell",
-            f"Mean-reversion take-profit: close {close:.2f} recovered above middle band {bb_middle:.2f} and RSI {rsi_value:.2f} >= {midline_exit_rsi_above:.2f}",
-            quantity,
-        )
-    return (
-        "hold",
-        f"No configured rule fired; close {close:.2f}, BB[{bb_lower:.2f}, {bb_middle:.2f}, {bb_upper:.2f}], RSI {rsi_value:.2f}",
-        quantity,
-    )
+
+
+
 
 
 def stop_loss_signal_for_symbol(
@@ -3347,83 +3254,6 @@ def stop_loss_signal_for_symbol(
     )
 
 
-def evaluate_combined_signal(
-    strategy_cfg: Dict[str, Any],
-    indicators: Dict[str, Any],
-    quantity: float | str,
-    scale: float,
-    df: pd.DataFrame | None = None,
-    higher_tf_df: pd.DataFrame | None = None,
-) -> tuple[str, str, float | str]:
-    fast_prev = float(indicators["ma_fast_prev"])
-    fast_now = float(indicators["ma_fast"])
-    slow_prev = float(indicators["ma_slow_prev"])
-    slow_now = float(indicators["ma_slow"])
-    rsi_value = float(indicators["rsi"]) if indicators.get("rsi") is not None else 50.0
-    rsi_upper = float(strategy_cfg.get("rsi_upper", 70))
-    rsi_lower = float(strategy_cfg.get("rsi_lower", 30))
-    golden_cross = fast_prev <= slow_prev and fast_now > slow_now
-    death_cross = fast_prev >= slow_prev and fast_now < slow_now
-
-    trend_filter_period = max(int(strategy_cfg.get("trend_filter_ema_period", 200) or 200), 1)
-    volume_lookback = max(int(strategy_cfg.get("volume_lookback", 20) or 20), 1)
-    volume_multiplier = float(strategy_cfg.get("volume_multiplier", 1.5) or 1.5)
-    higher_tf_period = max(int(strategy_cfg.get("higher_timeframe_ema_period", 50) or 50), 1)
-
-    above_200ema = True
-    ema200_value = None
-    if df is not None and not df.empty and len(df) >= trend_filter_period:
-        ema200 = pd.to_numeric(df["close"], errors="coerce").ewm(span=trend_filter_period, adjust=False).mean()
-        ema200_value = float(ema200.iloc[-1])
-        above_200ema = float(df["close"].iloc[-1]) > ema200_value
-
-    volume_ok = True
-    average_volume = None
-    current_volume = None
-    if df is not None and not df.empty and golden_cross and len(df) >= volume_lookback:
-        volume_series = pd.to_numeric(df["volume"], errors="coerce")
-        average_volume = float(volume_series.tail(volume_lookback).mean())
-        current_volume = float(volume_series.iloc[-1])
-        volume_ok = current_volume > (average_volume * volume_multiplier)
-
-    higher_trend_ok = True
-    higher_ema_value = None
-    if higher_tf_df is not None and not higher_tf_df.empty and len(higher_tf_df) >= higher_tf_period:
-        higher_close = pd.to_numeric(higher_tf_df["close"], errors="coerce")
-        higher_ema = higher_close.ewm(span=higher_tf_period, adjust=False).mean()
-        higher_ema_value = float(higher_ema.iloc[-1])
-        higher_trend_ok = float(higher_close.iloc[-1]) > higher_ema_value
-
-    indicators["trend_filter_above_ema"] = above_200ema
-    indicators["trend_filter_ema_value"] = ema200_value
-    indicators["volume_confirmation"] = volume_ok
-    indicators["avg_volume"] = average_volume
-    indicators["current_volume"] = current_volume
-    indicators["higher_trend_ok"] = higher_trend_ok
-    indicators["higher_tf_ema"] = higher_ema_value
-
-    if golden_cross and rsi_value <= rsi_upper and above_200ema and volume_ok and higher_trend_ok:
-        if float(quantity) <= 0:
-            return (
-                "hold",
-                f"Combined-strategy buy signal fired but scaled quantity rounded to zero after position scale {scale:.2f}",
-                quantity,
-            )
-        return (
-            "buy",
-            f"Enhanced combined entry: MA{strategy_cfg['fast']} crossed above MA{strategy_cfg['slow']}, RSI {rsi_value:.2f} <= {rsi_upper:.2f}, price above EMA{trend_filter_period}, volume confirmed, higher timeframe aligned",
-            quantity,
-        )
-    if death_cross or rsi_value >= rsi_upper:
-        if strategy_cfg.get("sell_all_on_exit", True):
-            quantity = "ALL"
-        trigger = "death_cross" if death_cross else f"RSI {rsi_value:.2f} >= {rsi_upper:.2f}"
-        return ("sell", f"Enhanced combined exit: {trigger}", quantity)
-    return (
-        "hold",
-        f"No configured rule fired; MA{strategy_cfg['fast']}={indicators['ma_fast']:.2f}, MA{strategy_cfg['slow']}={indicators['ma_slow']:.2f}, RSI {rsi_value:.2f}, oversold guard {rsi_lower:.2f}",
-        quantity,
-    )
 
 
 def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3513,19 +3343,10 @@ def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     stop_loss_override = stop_loss_signal_for_symbol(symbol, market, df, rules)
     if stop_loss_override is not None:
         signal, reason, quantity = stop_loss_override
-    elif strategy_kind == "mean_reversion":
-        signal, reason, quantity = evaluate_mean_reversion_signal(strategy_cfg, indicators, quantity, scale)
-    elif strategy_kind == "combined":
-        signal, reason, quantity = evaluate_combined_signal(
-            strategy_cfg,
-            indicators,
-            quantity,
-            scale,
-            df=df,
-            higher_tf_df=higher_tf_df,
-        )
     else:
-        signal, reason, quantity = evaluate_trend_following_signal(
+        # Use kernel pure functions for signal evaluation
+        signal, reason, quantity = kernel_evaluate_signal(
+            strategy_kind,
             strategy_cfg,
             indicators,
             quantity,
