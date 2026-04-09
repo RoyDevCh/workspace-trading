@@ -28,7 +28,7 @@ As of `2026-04-09`, the system is running:
 - **Price data**: Binance mainnet (real prices) via `sensory/sources.ccxt.testnet: false`
 - **Execution**: Binance futures testnet (test orders, not real money), `market_type="swap"`
 - **A-share execution**: MyQuant `gm.api` route working (fixed 2026-04-09), simulation account 1,000,000 CNY
-- **GM Token**: `<GM_TOKEN>`, Account ID: `e1255940-325a-11f1-ab23-00163e022aa6`
+- **GM Token**: configured via env var `GM_TOKEN` / `GMTRADE_TOKEN`, Account ID: `e1255940-325a-11f1-ab23-00163e022aa6`
 - **Notification**: Discord only, using `openclaw-bot#2977` via `discord_agent_bridge.py`
 - **Discord bridge v2**: Exponential backoff reconnect, heartbeat ACK timeout detection, SSL error tolerance — 100% heartbeat ACK rate
 - **Discord daemon**: Auto-restart via `discord_bridge_daemon.py`, Windows scheduled task `DiscordBridge` runs at logon

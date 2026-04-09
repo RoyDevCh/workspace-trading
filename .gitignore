@@ -1,6 +1,42 @@
+# Sensitive config files - contain API keys and tokens
+config.yaml
+openclaw.json
+execution_config.yaml
+
+# Logs and runtime state
+logs/
+runtime/
+state/
+*.log
+*.pid
+
+# Python cache
 __pycache__/
 *.pyc
-logs/
-*.log
-trading_state.json
+*.pyo
+
+# Backup files
+*.bak
+*.bak-*
+*.upload
+
+# Environment files with secrets
+.env
+.env.*
+
+# Debug/test output
 trading_decisions.jsonl
+optimize_dry_run.json
+update_macro_auto.json
+market_*.json
+
+# Large third-party directories
+cryptoclaw/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

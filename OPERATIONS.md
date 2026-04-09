@@ -51,7 +51,7 @@ Current A-share execution notes:
 
 - Preferred no-GUI simulation path is the MyQuant `gm.api` / `gmtrade` runtime exposed through `backtest_strategy`, `start_strategy_simulation`, and related bridge actions.
 - GM SDK runs on dedicated Python 3.11 runtime: `C:\Users\Roy\.openclaw\runtime\gm311\Scripts\python.exe`
-- GM Token: `<GM_TOKEN>`
+- GM Token: configured via env var `GM_TOKEN` / `GMTRADE_TOKEN`
 - Account ID: `e1255940-325a-11f1-ab23-00163e022aa6`
 - Use the real MyQuant UUID `account_id` for account-state checks. Friendly aliases can still leave `get_cash`, `get_position`, and `context.accounts` empty.
 - `SHSE.511990` is the current known-good same-session buy+sell validation symbol on the simulation account.
