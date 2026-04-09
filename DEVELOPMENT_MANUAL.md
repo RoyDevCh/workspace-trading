@@ -1,6 +1,6 @@
 ﻿# OpenClaw Trading System Development Manual
 
-Last updated: `2026-04-09` (kernel refactor)
+Last updated: `2026-04-09` (sync remote updates — GM strategy actions, bridge expansion)
 
 Bug fix history is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -35,6 +35,8 @@ As of `2026-04-09`, the system is running:
 - **Macro refresh**: Every 15 min
 - **Strategy optimization**: Nightly at 02:00
 - **Asset discovery**: Hourly, auto-adds/removes symbols based on volume/volatility
+- **GM strategy optimization**: Parameter sweep via backtest, best config selected by sharpe_ratio
+- **GM strategy simulation**: Long-running live simulation via gm.api, start/stop/status managed by bridge
 - **Data sources**: A-share uses Sina/Tencent realtime API (primary) → akshare → yfinance fallback
 
 ### Current A-share status
@@ -70,7 +72,7 @@ As of `2026-04-09`, the system is running:
 
 The local backup at `C:\Users\Roy\.openclaw\workspace-trading\` contains:
 
-- `openclaw_trading_bridge.py` — Main trading bridge (30+ actions, calls kernel modules)
+- `openclaw_trading_bridge.py` — Main trading bridge (22 actions, ~7200 lines — includes GM strategy management, asset discovery, inline strategy evaluation)
 - `execution/execution.py` — Execution layer (CCXTExecutionProvider, GmTradeProvider, ExecutionManager)
 - `execution/__init__.py` — Package init
 - `kernel/` — **Trading kernel (pure functions, no I/O)** — extracted 2026-04-09
@@ -140,7 +142,7 @@ More concretely:
 3. `openclaw_trading_bridge.py` dispatches the action.
 4. The bridge reads config and rules.
 5. Data comes from `SinaRealtimeProvider` (primary for A-share), `ccxt` (crypto), `akshare`/`yfinance` (fallback).
-6. **Signal generation and risk checks use `kernel/` pure functions** (no I/O, no side effects).
+6. **Signal generation and risk checks**: The local backup has `kernel/` pure-function modules, but the **running remote bridge uses inline strategy functions** (OpenClaw runtime overwrites kernel imports). Both approaches are functionally equivalent — the kernel exists for testability and future extraction.
 7. `kernel/decision.py` produces an `OrderIntent` with deterministic hash for idempotency.
 8. `kernel/risk.py` evaluates risk limits and returns `RiskResult(allowed, reasons)`.
 9. `kernel/order_log.py` deduplicates orders by intent hash.
@@ -262,6 +264,8 @@ Discord user sends message
 
 The deterministic core. No I/O, no global state, no network calls.
 
+> **Note (2026-04-09)**: The running remote bridge currently uses **inline strategy functions** rather than importing from `kernel/`. The OpenClaw runtime regenerates the bridge file, overwriting kernel imports. The `kernel/` package still exists and passes all unit tests — it serves as the testable reference implementation and the target for future extraction.
+
 - `kernel/decision.py` — `OrderIntent` dataclass + `make_decision()` pure function
   - Takes market data + strategy signal + risk result, produces an `OrderIntent`
   - `intent_hash` is SHA-256 of (symbol, side, quantity, price, stop_price, strategy, timestamp_minute)
@@ -292,15 +296,44 @@ Design principles:
 
 Key responsibilities:
 
-- Unified tool entrypoint (30+ actions)
+- Unified tool entrypoint (22 actions)
 - Market-aware review universe that can be filtered into separate crypto and cn_equity lanes
 - Per-symbol strategy resolution (combined, trend_following, mean_reversion)
 - Indicator calculation (EMA, RSI, MACD, Bollinger)
-- Signal generation and validation
+- Signal generation and validation (inline strategy functions on remote; kernel imports on local)
 - Risk checks (max loss, position size, daily budget)
 - Order routing via approval/rejection/execution
 - Decision logging and state persistence
 - Operator notifications via Discord
+- **GM strategy management**: backtest, simulation start/stop/status, strategy optimization, account probe
+- **Asset discovery/cleanup**: auto-adds/removes symbols based on volume/volatility
+
+Complete action list:
+
+| Action | Purpose |
+|--------|---------|
+| `action_get_portfolio_snapshot` | Portfolio state snapshot |
+| `action_get_trading_state` | Trading state (pause, budget, recent events) |
+| `action_get_review_universe` | Symbols to review for a market |
+| `action_run_market_review_once` | Single market review cycle |
+| `action_update_macro_state` | Refresh macro state |
+| `action_get_macro_state` | Read macro state |
+| `action_get_market_data` | Fetch price data for a symbol |
+| `action_calculate_indicator` | Compute indicators for a symbol |
+| `action_generate_signal` | Generate trading signal |
+| `action_check_risk` | Risk limit validation |
+| `action_place_order` | Execute order after risk check |
+| `action_cleanup_assets` | Remove stale assets |
+| `action_discover_assets` | Auto-discover new trading symbols |
+| `action_probe_gm_account` | Probe MyQuant account state |
+| `action_backtest_strategy` | Run GM strategy backtest |
+| `action_get_strategy_simulation_status` | Check simulation status |
+| `action_stop_strategy_simulation` | Stop running simulation |
+| `action_start_strategy_simulation` | Start GM strategy simulation |
+| `action_optimize_gm_strategy` | Optimize GM strategy parameters |
+| `action_optimize_strategy` | General strategy optimization |
+| `action_record_trading_decision` | Log a trading decision |
+| `action_reconcile_approvals` | Reconcile approval states |
 
 Key design patterns:
 
@@ -338,6 +371,10 @@ Files: `gm_strategy_runtime.py`, `templates/gm_ma_cross_template.py`, `templates
 - Stores rendered scripts, pid/state, reports, and logs under `runtime/gm_strategy/`
 - Supports backtest, long-running simulation, account probe, and one-shot order submission
 - Uses dedicated Python 3.11 runtime at `C:\Users\Roy\.openclaw\runtime\gm311\Scripts\python.exe`
+- **Strategy optimization**: `action_optimize_gm_strategy` runs parameter sweeps via backtest, selects best by configurable metric (default: `sharpe_ratio`)
+- **Simulation management**: `action_start_strategy_simulation` / `action_stop_strategy_simulation` / `action_get_strategy_simulation_status` for long-running GM strategies
+- **Account probing**: `action_probe_gm_account` validates account connectivity and returns cash/position state
+- **Backtest results** stored in `runtime/gm_strategy/backtests/`, optimization reports in `runtime/gm_strategy/optimization_report.json`
 
 ### 5.6 Sensory layer (`data_provider.py`)
 
@@ -590,7 +627,15 @@ openclaw plugins doctor
 - If `gmtrade` is installed in the future, `connect()` will prefer it; `gm.api` is the fallback
 - `gm` package is installed on BOTH Python312 and gm311 runtime as of 2026-04-09
 
-### 11.9 Do not start desktop bridge from plain SSH
+### 11.9 OpenClaw runtime overwrites kernel imports
+
+- The `kernel/` pure-function modules exist and pass all unit tests, but the **running remote bridge uses inline strategy functions** instead of importing from `kernel/`
+- OpenClaw's runtime regenerates/updates `openclaw_trading_bridge.py`, replacing `from kernel.strategy import evaluate_signal` with inline `def evaluate_*_signal()` functions
+- The kernel modules remain the testable, deterministic reference implementation
+- To make kernel imports stick, the bridge would need to be deployed as a static file (not managed by OpenClaw runtime)
+- This is a known divergence between local backup (has kernel imports in git history) and running remote (inline functions)
+
+### 11.10 Do not start desktop bridge from plain SSH
 
 - Process may start in wrong window station
 - Always use `\AutoStartTHSBridge` scheduled task

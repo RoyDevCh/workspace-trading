@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
+import itertools
 import json
+import math
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -30,11 +33,20 @@ DEFAULT_MACRO_STATE_PATH = WORKSPACE_DIR / "runtime" / "macro_state.json"
 DEFAULT_LOG_PATH = WORKSPACE_DIR / "logs" / "trading_decisions.jsonl"
 DEFAULT_OPTIMIZATION_REPORT_PATH = WORKSPACE_DIR / "runtime" / "strategy_report.json"
 DEFAULT_RUNTIME_LOCK_PATH = WORKSPACE_DIR / "runtime" / "trading_runtime.lock"
+DEFAULT_GM_STRATEGY_RUNTIME_DIR = WORKSPACE_DIR / "runtime" / "gm_strategy"
+DEFAULT_GM_STRATEGY_TEMPLATE_PATH = WORKSPACE_DIR / "templates" / "gm_ma_cross_template.py"
+DEFAULT_GM_ACCOUNT_PROBE_TEMPLATE_PATH = WORKSPACE_DIR / "templates" / "gm_account_probe_template.py"
+DEFAULT_GM_STRATEGY_SIM_STATE_PATH = DEFAULT_GM_STRATEGY_RUNTIME_DIR / "simulation_state.json"
+DEFAULT_GM_STRATEGY_OPTIMIZATION_REPORT_PATH = DEFAULT_GM_STRATEGY_RUNTIME_DIR / "optimization_report.json"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 ENV_CANDIDATE_PATHS = [
     OPENCLAW_ROOT / "agents" / "trading" / ".env",
     OPENCLAW_ROOT / "agents" / "trading" / "agent" / ".env",
     WORKSPACE_DIR / ".env",
+]
+OPENCLAW_RUNTIME_CONFIG_CANDIDATE_PATHS = [
+    OPENCLAW_ROOT / "openclaw.json",
+    Path.home() / ".openclaw" / "openclaw.json",
 ]
 
 _ENV_LOADED = False
@@ -45,23 +57,20 @@ from execution import create_executor
 from gatekeeper.gatekeeper import (
     APPROVAL_STATE_PATH,
     GateKeeperSkill,
-    collect_feishu_targets,
-    find_feishu_reply,
     load_json as load_approval_json,
     now_ts as approval_now_ts,
     parse_iso_timestamp,
     save_json as save_approval_json,
-    send_native_feishu_text,
+)
+from gm_strategy_runtime import (
+    GmStrategyRuntimeError,
+    read_simulation_state as gm_read_simulation_state,
+    run_backtest as gm_run_backtest,
+    run_live_once as gm_run_live_once,
+    start_simulation as gm_start_simulation,
+    stop_simulation_process as gm_stop_simulation_process,
 )
 from sensory import create_data_manager
-
-# Kernel pure-function imports (extracted 2026-04-09)
-from kernel.strategy import evaluate_signal as kernel_evaluate_signal
-from kernel.strategy.registry import (
-    evaluate_trend_following_signal as kernel_evaluate_trend_following_signal,
-    evaluate_mean_reversion_signal as kernel_evaluate_mean_reversion_signal,
-    evaluate_combined_signal as kernel_evaluate_combined_signal,
-)
 
 
 class TradingBridgeError(RuntimeError):
@@ -128,6 +137,15 @@ def load_yaml(path: Path) -> Dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
+def load_json_file(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig")) or {}
+    except Exception:
+        return {}
+
+
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     merged = dict(base)
     for key, value in override.items():
@@ -141,6 +159,109 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 def get_rules_path(payload: Dict[str, Any]) -> Path:
     candidate = payload.get("rules_file")
     return Path(candidate) if candidate else DEFAULT_RULES_PATH
+
+
+def load_openclaw_runtime_config() -> Dict[str, Any]:
+    load_runtime_env()
+    for candidate in OPENCLAW_RUNTIME_CONFIG_CANDIDATE_PATHS:
+        payload = load_json_file(candidate)
+        if payload:
+            return payload
+    return {}
+
+
+def unique_non_empty_text(values: List[Any]) -> List[str]:
+    items: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in items:
+            items.append(text)
+    return items
+
+
+def collect_discord_targets(config: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> List[str]:
+    notification_cfg = config.get("notification", {})
+    discord_cfg = notification_cfg.get("discord", {})
+    runtime_channel_cfg = runtime_cfg.get("channels", {}).get("discord", {})
+    runtime_plugin_cfg = runtime_cfg.get("plugins", {}).get("entries", {}).get("discord", {})
+    candidates: List[Any] = [
+        os.getenv("OPENCLAW_DISCORD_CHANNEL_ID", ""),
+        os.getenv("DISCORD_CHANNEL_ID", ""),
+        notification_cfg.get("discord_target", ""),
+        notification_cfg.get("target", ""),
+    ]
+    if isinstance(discord_cfg, dict):
+        candidates.extend(
+            [
+                discord_cfg.get("target", ""),
+                discord_cfg.get("channel_id", ""),
+                discord_cfg.get("channelId", ""),
+            ]
+        )
+    if isinstance(runtime_channel_cfg, dict):
+        candidates.append(runtime_channel_cfg.get("channelId", ""))
+    if isinstance(runtime_plugin_cfg, dict):
+        candidates.append(runtime_plugin_cfg.get("channelId", ""))
+    return unique_non_empty_text(candidates)
+
+
+def resolve_discord_bot_token(config: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> str:
+    notification_cfg = config.get("notification", {})
+    discord_cfg = notification_cfg.get("discord", {})
+    runtime_channel_cfg = runtime_cfg.get("channels", {}).get("discord", {})
+    runtime_plugin_cfg = runtime_cfg.get("plugins", {}).get("entries", {}).get("discord", {})
+    token_env = "OPENCLAW_DISCORD_BOT_TOKEN"
+    if isinstance(discord_cfg, dict):
+        token_env = str(discord_cfg.get("bot_token_env", token_env)).strip() or token_env
+    candidates: List[Any] = [
+        os.getenv(token_env, ""),
+        os.getenv("DISCORD_BOT_TOKEN", ""),
+    ]
+    if isinstance(runtime_channel_cfg, dict):
+        candidates.append(runtime_channel_cfg.get("botToken", ""))
+    if isinstance(runtime_plugin_cfg, dict):
+        candidates.append(runtime_plugin_cfg.get("botToken", ""))
+    values = unique_non_empty_text(candidates)
+    return values[0] if values else ""
+
+
+def truncate_discord_message(message: str, limit: int = 1900) -> str:
+    text = str(message or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 3, 0)].rstrip() + "..."
+
+
+def send_native_discord_text(target: str, message: str, token: str) -> Dict[str, Any]:
+    if not target:
+        return {"ok": False, "error": "discord_target_missing"}
+    if not token:
+        return {"ok": False, "error": "discord_bot_token_missing"}
+
+    try:
+        import requests
+
+        response = requests.post(
+            f"https://discord.com/api/v10/channels/{target}/messages",
+            headers={
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json",
+            },
+            json={"content": truncate_discord_message(message)},
+            timeout=10,
+        )
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        return {
+            "ok": response.status_code in (200, 201),
+            "status_code": response.status_code,
+            "payload": payload,
+            "error": "" if response.status_code in (200, 201) else str(payload or response.text[:300]),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def default_rules() -> Dict[str, Any]:
@@ -170,7 +291,7 @@ def default_rules() -> Dict[str, Any]:
                 "cn_equity": {
                     "timeframe": "1d",
                     "lookback": 120,
-                    "source": "sina",
+                    "source": "akshare",
                 },
                 "futures": {
                     "timeframe": "1h",
@@ -185,16 +306,39 @@ def default_rules() -> Dict[str, Any]:
             "lookback": 100,
         },
         "strategy": {
-            "default_strategy": "combined",
+            "default_strategy": "dynamic",
+            "strategy_weights": {
+                "trend_following": 1.0,
+                "mean_reversion": 1.0,
+                "breakout": 1.0,
+            },
             "definitions": {
+                "dynamic": {
+                    "name": "dynamic",
+                    "kind": "dynamic",
+                    "enabled_strategies": ["trend_following", "mean_reversion", "breakout"],
+                    "sell_all_on_exit": True,
+                    "order_size": {
+                        "default": 0.001,
+                    },
+                },
                 "trend_following": {
                     "name": "trend_following",
                     "kind": "trend_following",
+                    "fast": 5,
+                    "slow": 20,
                     "ema_fast_period": 5,
                     "ema_slow_period": 20,
                     "rsi_period": 14,
                     "buy_rsi_below": 70,
                     "sell_rsi_above": 85,
+                    "rsi_oversold": 70,
+                    "rsi_overbought": 85,
+                    "atr_period": 14,
+                    "atr_multiplier": 2.0,
+                    "use_trend_filter": True,
+                    "trend_ema_period": 200,
+                    "trend_filter_ema_period": 200,
                     "sell_all_on_exit": True,
                     "order_size": {
                         "default": 0.001,
@@ -239,19 +383,22 @@ def default_rules() -> Dict[str, Any]:
                         "default": 0.05,
                     },
                 },
+                "breakout": {
+                    "name": "breakout",
+                    "kind": "breakout",
+                    "lookback_high": 20,
+                    "lookback_low": 10,
+                    "atr_period": 14,
+                    "atr_stop_multiplier": 2.0,
+                    "sell_all_on_exit": True,
+                    "order_size": {
+                        "default": 0.05,
+                    },
+                },
             },
             "market_overrides": {
                 "cn_equity": {
-                    "strategy": "trend_following",
-                    "ema_fast_period": 8,
-                    "ema_slow_period": 21,
-                    "rsi_period": 14,
-                    "buy_rsi_below": 68,
-                    "sell_rsi_above": 82,
-                    "use_higher_timeframe_filter": True,
-                    "higher_timeframe": "1wk",
-                    "higher_timeframe_ema_period": 13,
-                    "higher_timeframe_lookback": 80,
+                    "strategy": "dynamic",
                     "order_size": {
                         "default": 100,
                     },
@@ -307,9 +454,7 @@ def default_rules() -> Dict[str, Any]:
                     },
                 },
                 "510300": {
-                    "strategy": "trend_following",
-                    "ema_fast_period": 8,
-                    "ema_slow_period": 21,
+                    "strategy": "dynamic",
                     "order_size": {
                         "default": 200,
                         "per_symbol": {
@@ -318,9 +463,7 @@ def default_rules() -> Dict[str, Any]:
                     },
                 },
                 "159915": {
-                    "strategy": "trend_following",
-                    "ema_fast_period": 8,
-                    "ema_slow_period": 21,
+                    "strategy": "dynamic",
                     "order_size": {
                         "default": 200,
                         "per_symbol": {
@@ -353,7 +496,7 @@ def default_rules() -> Dict[str, Any]:
             },
             "market_modes": {
                 "crypto": "ccxt_futures",
-                "cn_equity": "ths_bridge",
+                "cn_equity": "gmtrade",
                 "futures": "ccxt_futures",
             },
         },
@@ -431,7 +574,7 @@ def default_rules() -> Dict[str, Any]:
                 "max_new_per_scan": 3,
                 "max_inactive_trading_days": 10,
                 "max_drawdown_pct": 0.10,
-                "strategy": "trend_following",
+                "strategy": "dynamic",
                 "position_scale": 0.3,
                 "order_size_default": 100,
                 "candidate_universe": [
@@ -728,6 +871,7 @@ def load_state(rules: Dict[str, Any]) -> Dict[str, Any]:
             "daily_risk_committed": {},
             "open_positions": {},
             "recent_events": [],
+            "strategy_performance": {},
             "updated_at": None,
         }
     with state_path.open("r", encoding="utf-8") as handle:
@@ -739,6 +883,7 @@ def load_state(rules: Dict[str, Any]) -> Dict[str, Any]:
     state.setdefault("daily_risk_committed", {})
     state.setdefault("open_positions", {})
     state.setdefault("recent_events", [])
+    state.setdefault("strategy_performance", {})
     state.setdefault("updated_at", None)
     return state
 
@@ -926,6 +1071,8 @@ def bollinger_bundle(closes: pd.Series, period: int, stddev: float) -> Dict[str,
 def normalize_strategy_kind(value: Any) -> str:
     text = str(value or "").strip().lower()
     mapping = {
+        "dynamic": "dynamic",
+        "weighted_dynamic": "dynamic",
         "ema_rsi_guard": "trend_following",
         "ema_cross": "trend_following",
         "trend": "trend_following",
@@ -936,12 +1083,25 @@ def normalize_strategy_kind(value: Any) -> str:
         "bollinger_mean_reversion": "mean_reversion",
         "mean": "mean_reversion",
         "mean_reversion": "mean_reversion",
+        "donchian": "breakout",
+        "donchian_breakout": "breakout",
+        "breakout": "breakout",
     }
     return mapping.get(text, text or "trend_following")
 
 
 def strategy_template_for_kind(kind: str) -> Dict[str, Any]:
     normalized = normalize_strategy_kind(kind)
+    if normalized == "dynamic":
+        return {
+            "name": "dynamic",
+            "kind": "dynamic",
+            "enabled_strategies": ["trend_following", "mean_reversion", "breakout"],
+            "sell_all_on_exit": True,
+            "order_size": {
+                "default": 0.001,
+            },
+        }
     if normalized == "combined":
         return {
             "name": "combined",
@@ -973,11 +1133,27 @@ def strategy_template_for_kind(kind: str) -> Dict[str, Any]:
             "kind": "mean_reversion",
             "bb_period": 20,
             "bb_stddev": 2.0,
+            "bb_std": 2.0,
             "rsi_period": 14,
             "buy_rsi_below": 38,
             "sell_rsi_above": 68,
+            "rsi_oversold": 38,
+            "rsi_overbought": 68,
             "exit_on_midline": True,
             "midline_exit_rsi_above": 52,
+            "sell_all_on_exit": True,
+            "order_size": {
+                "default": 0.05,
+            },
+        }
+    if normalized == "breakout":
+        return {
+            "name": "breakout",
+            "kind": "breakout",
+            "lookback_high": 20,
+            "lookback_low": 10,
+            "atr_period": 14,
+            "atr_stop_multiplier": 2.0,
             "sell_all_on_exit": True,
             "order_size": {
                 "default": 0.05,
@@ -986,11 +1162,20 @@ def strategy_template_for_kind(kind: str) -> Dict[str, Any]:
     return {
         "name": "trend_following",
         "kind": "trend_following",
+        "fast": 5,
+        "slow": 20,
         "ema_fast_period": 5,
         "ema_slow_period": 20,
         "rsi_period": 14,
         "buy_rsi_below": 70,
         "sell_rsi_above": 85,
+        "rsi_oversold": 70,
+        "rsi_overbought": 85,
+        "atr_period": 14,
+        "atr_multiplier": 2.0,
+        "use_trend_filter": False,
+        "trend_ema_period": 200,
+        "trend_filter_ema_period": 200,
         "use_higher_timeframe_filter": False,
         "higher_timeframe": "1wk",
         "higher_timeframe_ema_period": 13,
@@ -1002,6 +1187,42 @@ def strategy_template_for_kind(kind: str) -> Dict[str, Any]:
     }
 
 
+def _setdefault_strategy_alias(config: Dict[str, Any], primary_key: str, *aliases: str) -> None:
+    value = None
+    for key in (primary_key, *aliases):
+        if key in config and config.get(key) not in (None, ""):
+            value = config.get(key)
+            break
+    if value in (None, ""):
+        return
+    config.setdefault(primary_key, value)
+    for alias in aliases:
+        config.setdefault(alias, value)
+
+
+def canonicalize_strategy_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(config or {})
+    kind = normalize_strategy_kind(normalized.get("kind") or normalized.get("strategy") or normalized.get("name"))
+
+    if kind == "trend_following":
+        _setdefault_strategy_alias(normalized, "ema_fast_period", "fast")
+        _setdefault_strategy_alias(normalized, "ema_slow_period", "slow")
+        _setdefault_strategy_alias(normalized, "trend_filter_ema_period", "trend_ema_period")
+        _setdefault_strategy_alias(normalized, "buy_rsi_below", "rsi_oversold")
+        _setdefault_strategy_alias(normalized, "sell_rsi_above", "rsi_overbought")
+        _setdefault_strategy_alias(normalized, "atr_multiplier", "atr_stop_multiplier")
+    elif kind == "mean_reversion":
+        _setdefault_strategy_alias(normalized, "bb_stddev", "bb_std")
+        _setdefault_strategy_alias(normalized, "buy_rsi_below", "rsi_oversold")
+        _setdefault_strategy_alias(normalized, "sell_rsi_above", "rsi_overbought")
+    elif kind == "breakout":
+        _setdefault_strategy_alias(normalized, "atr_stop_multiplier", "atr_multiplier", "atr_stop")
+    elif kind == "dynamic" and not normalized.get("enabled_strategies"):
+        normalized["enabled_strategies"] = ["trend_following", "mean_reversion", "breakout"]
+
+    return normalized
+
+
 def normalize_strategy_definition(definition: Dict[str, Any] | None, fallback_name: str) -> Dict[str, Any]:
     raw = dict(definition or {})
     requested_name = str(raw.get("name") or fallback_name or "").strip() or "trend_following"
@@ -1009,6 +1230,7 @@ def normalize_strategy_definition(definition: Dict[str, Any] | None, fallback_na
     normalized_kind = normalize_strategy_kind(requested_kind)
     base = strategy_template_for_kind(normalized_kind)
     merged = deep_merge(base, raw)
+    merged = canonicalize_strategy_config(merged)
     merged["name"] = requested_name
     merged["kind"] = normalized_kind
     return merged
@@ -1078,6 +1300,7 @@ def calculate_indicator_bundle(df: pd.DataFrame, rules: Dict[str, Any], params: 
     rsi_period = int(params.get("rsi_period", strategy.get("rsi_period", 14)))
     bb_period = int(params.get("bb_period", strategy.get("bb_period", 20)))
     bb_stddev = float(params.get("bb_stddev", strategy.get("bb_stddev", strategy.get("bb_std", 2.0))))
+    atr_period = int(params.get("atr_period", strategy.get("atr_period", 14)))
 
     closes = df["close"]
     fast_ema = ema_series(closes, fast_period)
@@ -1086,6 +1309,7 @@ def calculate_indicator_bundle(df: pd.DataFrame, rules: Dict[str, Any], params: 
     slow_sma = sma_series(closes, slow_period)
     rsi = rsi_series(closes, rsi_period)
     bb = bollinger_bundle(closes, bb_period, bb_stddev)
+    atr = atr_series(df, atr_period)
 
     bundle = {
         "strategy_name": str(strategy.get("name") or default_strategy_name_from_rules(rules)),
@@ -1107,6 +1331,11 @@ def calculate_indicator_bundle(df: pd.DataFrame, rules: Dict[str, Any], params: 
         ),
         "ma_fast_period": fast_period,
         "ma_slow_period": slow_period,
+        "atr_period": atr_period,
+        "atr": float(atr.iloc[-1]) if not atr.empty and not pd.isna(atr.iloc[-1]) else None,
+        "atr_prev": float(atr.iloc[-2]) if len(atr) > 1 and not pd.isna(atr.iloc[-2]) else (
+            float(atr.iloc[-1]) if not atr.empty and not pd.isna(atr.iloc[-1]) else None
+        ),
         "rsi": float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else None,
         "close": float(closes.iloc[-1]),
         "close_prev": float(closes.iloc[-2]) if len(closes) > 1 else float(closes.iloc[-1]),
@@ -1272,6 +1501,31 @@ def executed_trade_count_for_day(rules: Dict[str, Any], market: str, day_key: st
             continue
         count += 1
     return count
+
+
+def executed_notional_for_day(rules: Dict[str, Any], market: str, day_key: str) -> float:
+    total = 0.0
+    for event in load_decision_events(rules):
+        if str(event.get("status") or "").strip().lower() != "executed":
+            continue
+        if str(event.get("timestamp") or "").strip()[:10] != day_key:
+            continue
+        event_market = str(
+            event.get("market")
+            or (event.get("details") or {}).get("market")
+            or ""
+        ).strip().lower()
+        if event_market != str(market or "").strip().lower():
+            continue
+        order_value = safe_float((event.get("risk") or {}).get("metrics", {}).get("order_value"))
+        if order_value is None:
+            quantity = safe_float(event.get("quantity"))
+            price = safe_float(event.get("price"))
+            if quantity is not None and price is not None:
+                order_value = float(quantity) * float(price)
+        if order_value is not None:
+            total += float(order_value)
+    return float(total)
 
 
 def symbol_position_scale(symbol: str, rules: Dict[str, Any], payload: Dict[str, Any] | None = None) -> float:
@@ -1665,6 +1919,65 @@ def review_markets_from_rules(rules: Dict[str, Any]) -> List[str]:
     return list(symbol_groups_from_rules(rules).keys())
 
 
+def normalize_market_name(value: Any) -> str:
+    market = str(value or "").strip().lower()
+    aliases = {
+        "spot": "crypto",
+        "stocks": "cn_equity",
+        "stock": "cn_equity",
+        "equity": "cn_equity",
+        "a_share": "cn_equity",
+        "a-share": "cn_equity",
+        "ashare": "cn_equity",
+        "a_shares": "cn_equity",
+        "a-shares": "cn_equity",
+        "shares": "cn_equity",
+    }
+    return aliases.get(market, market)
+
+
+def requested_markets_from_payload(payload: Dict[str, Any], available_markets: List[str]) -> List[str]:
+    raw_value = (
+        payload.get("markets")
+        if payload.get("markets") not in (None, "")
+        else payload.get("review_markets")
+        if payload.get("review_markets") not in (None, "")
+        else payload.get("market")
+        if payload.get("market") not in (None, "")
+        else payload.get("review_market")
+    )
+    if raw_value in (None, ""):
+        return [str(item) for item in available_markets]
+
+    if isinstance(raw_value, (list, tuple, set)):
+        candidates = list(raw_value)
+    else:
+        raw_text = str(raw_value).strip()
+        if not raw_text or raw_text.lower() in {"all", "*"}:
+            return [str(item) for item in available_markets]
+        candidates = [item for item in raw_text.replace(",", " ").split(" ") if item]
+
+    requested: List[str] = []
+    requested_set = set()
+    for candidate in candidates:
+        market = normalize_market_name(candidate)
+        if not market or market in {"all", "*"} or market in requested_set:
+            continue
+        requested.append(market)
+        requested_set.add(market)
+
+    if not requested:
+        return [str(item) for item in available_markets]
+
+    filtered: List[str] = []
+    available_lookup = {normalize_market_name(item): str(item) for item in available_markets}
+    for market in requested:
+        matched = available_lookup.get(market)
+        if matched and matched not in filtered:
+            filtered.append(matched)
+    return filtered or [str(item) for item in available_markets]
+
+
 def auto_execution_markets_from_rules(rules: Dict[str, Any]) -> List[str]:
     agent_cfg = rules.get("agent", {})
     configured = agent_cfg.get("auto_execution_markets") or agent_cfg.get("execution_markets")
@@ -1711,6 +2024,7 @@ def strategy_config_for_symbol(symbol: str, rules: Dict[str, Any], payload: Dict
     base = registry.get(resolved_name) or registry.get(default_strategy_name_from_rules(rules)) or next(iter(registry.values()))
     merged = deep_merge(base, {k: v for k, v in market_override.items() if k not in {"strategy", "strategy_name"}})
     merged = deep_merge(merged, {k: v for k, v in symbol_override.items() if k not in {"strategy", "strategy_name"}})
+    merged = canonicalize_strategy_config(merged)
     merged["name"] = resolved_name
     merged["kind"] = normalize_strategy_kind(merged.get("kind") or resolved_name)
     return merged
@@ -1718,6 +2032,125 @@ def strategy_config_for_symbol(symbol: str, rules: Dict[str, Any], payload: Dict
 
 def strategy_name_for_symbol(symbol: str, rules: Dict[str, Any], payload: Dict[str, Any] | None = None) -> str:
     return str(strategy_config_for_symbol(symbol, rules, payload).get("name") or default_strategy_name_from_rules(rules))
+
+
+def dynamic_strategy_weights_from_rules(rules: Dict[str, Any]) -> Dict[str, float]:
+    strategy_cfg = rules.get("strategy", {}) or {}
+    registry = strategy_registry_from_rules(rules)
+    configured = strategy_cfg.get("strategy_weights") or {}
+    candidate_names: List[str] = []
+
+    if isinstance(configured, dict):
+        for name in configured.keys():
+            text = str(name or "").strip()
+            if text and text not in candidate_names:
+                candidate_names.append(text)
+
+    for name, definition in registry.items():
+        kind = normalize_strategy_kind(definition.get("kind") or name)
+        if kind in {"trend_following", "mean_reversion", "breakout"} and name not in candidate_names:
+            candidate_names.append(name)
+
+    if not candidate_names:
+        candidate_names = ["trend_following", "mean_reversion", "breakout"]
+
+    weights: Dict[str, float] = {}
+    for name in candidate_names:
+        raw_value = configured.get(name, 1.0) if isinstance(configured, dict) else 1.0
+        try:
+            weights[name] = max(float(raw_value), 0.0)
+        except Exception:
+            weights[name] = 1.0
+
+    if not any(value > 0 for value in weights.values()):
+        weights = {name: 1.0 for name in candidate_names}
+    return weights
+
+
+def dynamic_component_configs(
+    rules: Dict[str, Any],
+    strategy_cfg: Dict[str, Any],
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, float]]:
+    registry = strategy_registry_from_rules(rules)
+    weights = dynamic_strategy_weights_from_rules(rules)
+    enabled_names = strategy_cfg.get("enabled_strategies") or list(weights.keys())
+    if not isinstance(enabled_names, list):
+        enabled_names = list(weights.keys())
+    component_overrides = strategy_cfg.get("component_overrides") if isinstance(strategy_cfg.get("component_overrides"), dict) else {}
+
+    components: Dict[str, Dict[str, Any]] = {}
+    for raw_name in enabled_names:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        base = registry.get(name)
+        if base is None:
+            kind = normalize_strategy_kind(name)
+            if kind in {"trend_following", "mean_reversion", "breakout"}:
+                base = normalize_strategy_definition({"kind": kind}, name)
+        if not isinstance(base, dict):
+            continue
+        kind = normalize_strategy_kind(base.get("kind") or name)
+        if kind not in {"trend_following", "mean_reversion", "breakout"}:
+            continue
+        merged = deep_merge(base, component_overrides.get(name, {}) or {})
+        merged = canonicalize_strategy_config(merged)
+        merged["name"] = str(base.get("name") or name)
+        merged["kind"] = kind
+        components[name] = merged
+        weights.setdefault(name, 1.0)
+
+    if not components:
+        for name in ("trend_following", "mean_reversion", "breakout"):
+            base = registry.get(name) or normalize_strategy_definition({"kind": name}, name)
+            components[name] = canonicalize_strategy_config(dict(base))
+            weights.setdefault(name, 1.0)
+
+    return components, weights
+
+
+def strategy_required_lookback(
+    strategy_cfg: Dict[str, Any],
+    requested_lookback: int,
+    rules: Dict[str, Any] | None = None,
+) -> int:
+    normalized = canonicalize_strategy_config(strategy_cfg)
+    kind = normalize_strategy_kind(normalized.get("kind") or normalized.get("name"))
+    required = max(int(requested_lookback or 0), 30)
+
+    if kind == "combined":
+        return max(
+            required,
+            int(normalized.get("trend_filter_ema_period", 200) or 200) + 5,
+            int(normalized.get("volume_lookback", 20) or 20) + 5,
+            int(normalized.get("atr_period", 14) or 14) + 10,
+            int(normalized.get("slow", normalized.get("ema_slow_period", 20)) or 20) + 5,
+        )
+    if kind == "trend_following":
+        return max(
+            required,
+            int(normalized.get("ema_slow_period", normalized.get("slow", 20)) or 20) + 5,
+            int(normalized.get("atr_period", 14) or 14) + 5,
+            int(normalized.get("trend_filter_ema_period", normalized.get("trend_ema_period", 200)) or 200) + 5,
+        )
+    if kind == "mean_reversion":
+        return max(
+            required,
+            int(normalized.get("bb_period", 20) or 20) + 5,
+            int(normalized.get("rsi_period", 14) or 14) + 5,
+        )
+    if kind == "breakout":
+        return max(
+            required,
+            int(normalized.get("lookback_high", 20) or 20) + 5,
+            int(normalized.get("lookback_low", 10) or 10) + 5,
+            int(normalized.get("atr_period", 14) or 14) + 5,
+        )
+    if kind == "dynamic" and rules is not None:
+        components, _ = dynamic_component_configs(rules, normalized)
+        for component in components.values():
+            required = max(required, strategy_required_lookback(component, requested_lookback, rules))
+    return required
 
 
 def default_source_for_market(market: str, payload: Dict[str, Any], rules: Dict[str, Any], root_cfg: Dict[str, Any]) -> str:
@@ -1750,7 +2183,7 @@ def source_candidates_for_market(market: str, requested_source: str) -> List[str
     source = str(requested_source or "").strip().lower() or "auto"
     if source == "auto":
         if market == "cn_equity":
-            candidates = ["sina", "akshare", "yfinance"]
+            candidates = ["akshare", "yfinance"]
         elif market == "futures":
             candidates = ["ccxt"]
         else:
@@ -1760,7 +2193,6 @@ def source_candidates_for_market(market: str, requested_source: str) -> List[str
         if market == "crypto" and source == "ccxt":
             candidates.append("yfinance")
         if market == "cn_equity" and source in {"akshare", "tushare"}:
-            candidates.append("sina")
             candidates.append("yfinance")
 
     deduped: List[str] = []
@@ -1785,11 +2217,30 @@ def execution_mode_for_market(market: str, payload: Dict[str, Any], rules: Dict[
     return str(rules.get("account", {}).get("execution_mode") or execution_cfg.get("default", "ccxt"))
 
 
+def execution_mode_supports_extended_cn_equity_session(mode: str, execution_cfg: Dict[str, Any]) -> bool:
+    normalized = str(mode or "").strip().lower()
+    if normalized in {"gm", "gmtrade"}:
+        gm_cfg = execution_cfg.get("gmtrade", {}) or {}
+        return bool(gm_cfg.get("allow_closed_session", False))
+    return False
+
+
+def session_execution_allowed_for_mode(
+    market: str,
+    session_status: Dict[str, Any],
+    mode: str,
+    execution_cfg: Dict[str, Any],
+) -> bool:
+    if market != "cn_equity":
+        return bool(session_status.get("execution_allowed", True))
+    if execution_mode_supports_extended_cn_equity_session(mode, execution_cfg):
+        return True
+    return bool(session_status.get("execution_allowed", True))
+
+
 def normalize_market_symbol(symbol: str, source: str, market: str | None = None) -> str:
     market = market or ("cn_equity" if extract_cn_equity_code(symbol) else "crypto")
     if source == "akshare":
-        return extract_cn_equity_code(symbol) or symbol
-    if source == "sina":
         return extract_cn_equity_code(symbol) or symbol
     if source != "yfinance":
         if market == "futures" and source == "ccxt":
@@ -1832,7 +2283,7 @@ def build_data_manager(payload: Dict[str, Any], rules: Dict[str, Any], source_ov
         )
         if market == "futures":
             futures_cfg = execution_cfg.get("futures", {})
-            kwargs["market_type"] = "swap"
+            kwargs["market_type"] = "future"
             kwargs["testnet"] = bool(
                 payload.get("testnet")
                 if payload.get("testnet") is not None
@@ -1890,6 +2341,40 @@ def optimization_config(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None =
 def optimization_report_path(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None = None) -> Path:
     cfg = optimization_config(rules, root_cfg)
     return resolve_workspace_path(cfg.get("report_file"), DEFAULT_OPTIMIZATION_REPORT_PATH)
+
+
+def gm_strategy_config(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    root_cfg = root_cfg or load_root_config()
+    root_section = root_cfg.get("gm_strategy", {}) or ((root_cfg.get("execution", {}) or {}).get("gm_strategy", {}) or {})
+    return deep_merge(root_section, rules.get("gm_strategy", {}))
+
+
+def gm_strategy_runtime_dir(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None = None) -> Path:
+    cfg = gm_strategy_config(rules, root_cfg)
+    return resolve_workspace_path(cfg.get("runtime_dir"), DEFAULT_GM_STRATEGY_RUNTIME_DIR)
+
+
+def gm_strategy_template_path(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None = None) -> Path:
+    cfg = gm_strategy_config(rules, root_cfg)
+    return resolve_workspace_path(cfg.get("template_file"), DEFAULT_GM_STRATEGY_TEMPLATE_PATH)
+
+
+def gm_account_probe_template_path(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None = None) -> Path:
+    cfg = gm_strategy_config(rules, root_cfg)
+    probe_cfg = cfg.get("account_probe", {}) or {}
+    return resolve_workspace_path(probe_cfg.get("template_file"), DEFAULT_GM_ACCOUNT_PROBE_TEMPLATE_PATH)
+
+
+def gm_strategy_simulation_state_path(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None = None) -> Path:
+    cfg = gm_strategy_config(rules, root_cfg)
+    simulation_cfg = cfg.get("simulation", {}) or {}
+    return resolve_workspace_path(simulation_cfg.get("state_file"), DEFAULT_GM_STRATEGY_SIM_STATE_PATH)
+
+
+def gm_strategy_optimization_report_path(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None = None) -> Path:
+    cfg = gm_strategy_config(rules, root_cfg)
+    optimization_cfg = cfg.get("optimization", {}) or {}
+    return resolve_workspace_path(optimization_cfg.get("report_file"), DEFAULT_GM_STRATEGY_OPTIMIZATION_REPORT_PATH)
 
 
 def default_macro_state() -> Dict[str, Any]:
@@ -2047,31 +2532,41 @@ def position_scale_for_market(market: str, rules: Dict[str, Any], root_cfg: Dict
         return 1.0
 
 
-def review_universe_items(rules: Dict[str, Any], root_cfg: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+def review_universe_items(
+    rules: Dict[str, Any],
+    root_cfg: Dict[str, Any] | None = None,
+    requested_markets: List[str] | None = None,
+) -> List[Dict[str, Any]]:
     root_cfg = root_cfg or load_root_config()
     macro_state = load_macro_state(rules, root_cfg)
     preferred_market = str(macro_state.get("preferred_market") or "")
     auto_execution_markets = set(auto_execution_markets_from_rules(rules))
     groups = symbol_groups_from_rules(rules)
     items: List[Dict[str, Any]] = []
+    markets_to_review = requested_markets or review_markets_from_rules(rules)
 
-    for market in review_markets_from_rules(rules):
+    for market in markets_to_review:
         settings = market_settings_for_market(market, rules)
         market_scale = position_scale_for_market(market, rules, root_cfg)
         session_status = market_session_status(market, rules, root_cfg)
         configured_execution_allowed = market in auto_execution_markets
-        execution_allowed = configured_execution_allowed and bool(session_status.get("execution_allowed", True))
-        execution_block_reason = ""
-        if not configured_execution_allowed:
-            execution_block_reason = "Auto execution is disabled for this market in auto_execution_markets"
-        elif not execution_allowed:
-            execution_block_reason = str(session_status.get("reason") or "Market session does not allow execution")
         execution_mode = execution_mode_for_market(
             market,
             {"market": market},
             rules,
             root_execution_config(),
         )
+        execution_allowed = configured_execution_allowed and session_execution_allowed_for_mode(
+            market,
+            session_status,
+            execution_mode,
+            root_execution_config(),
+        )
+        execution_block_reason = ""
+        if not configured_execution_allowed:
+            execution_block_reason = "Auto execution is disabled for this market in auto_execution_markets"
+        elif not execution_allowed:
+            execution_block_reason = str(session_status.get("reason") or "Market session does not allow execution")
         for symbol in groups.get(market, []):
             strategy_cfg = strategy_config_for_symbol(symbol, rules, {"symbol": symbol, "market": market})
             base_quantity = order_size_for_symbol(symbol, rules, {"symbol": symbol, "market": market})
@@ -2117,7 +2612,7 @@ def build_executor(payload: Dict[str, Any], rules: Dict[str, Any]):
             futures_runtime = trading_cfg.get("futures", {})
             kwargs["exchange_id"] = futures_cfg.get("exchange", ccxt_cfg.get("exchange", "binance"))
             kwargs["testnet"] = bool(payload.get("testnet") if payload.get("testnet") is not None else futures_cfg.get("testnet", True))
-            kwargs["market_type"] = "swap"
+            kwargs["market_type"] = "future"
             kwargs["default_leverage"] = resolve_requested_leverage(payload, futures_runtime)
             kwargs["max_leverage"] = int(futures_runtime.get("max_leverage", kwargs["default_leverage"]))
             kwargs["quote_asset"] = str(futures_cfg.get("quote_asset") or "USDT")
@@ -2135,7 +2630,7 @@ def build_executor(payload: Dict[str, Any], rules: Dict[str, Any]):
                 kwargs["secret"] = ccxt_cfg.get("secret")
     elif mode == "easytrader":
         easy_cfg = execution_cfg.get("easytrader", {})
-        kwargs["client"] = str(payload.get("broker_client") or easy_cfg.get("client") or "tonghuashun")
+        kwargs["client"] = str(payload.get("broker_client") or easy_cfg.get("client") or "")
         if easy_cfg.get("username"):
             kwargs["username"] = easy_cfg.get("username")
         if easy_cfg.get("password"):
@@ -2146,18 +2641,23 @@ def build_executor(payload: Dict[str, Any], rules: Dict[str, Any]):
             kwargs["port"] = int(easy_cfg.get("port"))
         if easy_cfg.get("prepare_path"):
             kwargs["prepare_path"] = easy_cfg.get("prepare_path")
-    elif mode == "ths_bridge":
-        ths_cfg = execution_cfg.get("ths_bridge", {})
-        kwargs["workspace"] = str(payload.get("bridge_workspace") or ths_cfg.get("workspace") or OPENCLAW_ROOT / "workspace")
-        if payload.get("ths_exe_path") or ths_cfg.get("exe_path"):
-            kwargs["exe_path"] = str(payload.get("ths_exe_path") or ths_cfg.get("exe_path"))
-        if ths_cfg.get("timeout_sec") is not None:
-            kwargs["timeout_sec"] = int(ths_cfg.get("timeout_sec"))
-        if ths_cfg.get("poll_interval_sec") is not None:
-            kwargs["poll_interval_sec"] = float(ths_cfg.get("poll_interval_sec"))
-        if ths_cfg.get("heartbeat_max_age_sec") is not None:
-            kwargs["heartbeat_max_age_sec"] = int(ths_cfg.get("heartbeat_max_age_sec"))
-        kwargs["require_interactive_session"] = bool(ths_cfg.get("require_interactive_session", True))
+    elif mode in {"gm", "gmtrade"}:
+        gm_cfg = execution_cfg.get("gmtrade", {})
+        if payload.get("gmtrade_token") or gm_cfg.get("token"):
+            kwargs["token"] = str(payload.get("gmtrade_token") or gm_cfg.get("token"))
+        if payload.get("gmtrade_account_id") or gm_cfg.get("account_id"):
+            kwargs["account_id"] = str(payload.get("gmtrade_account_id") or gm_cfg.get("account_id"))
+        if payload.get("gmtrade_account_alias") or gm_cfg.get("account_alias"):
+            kwargs["account_alias"] = str(payload.get("gmtrade_account_alias") or gm_cfg.get("account_alias"))
+        if payload.get("gmtrade_endpoint") or gm_cfg.get("endpoint"):
+            kwargs["endpoint"] = str(payload.get("gmtrade_endpoint") or gm_cfg.get("endpoint"))
+        kwargs["lot_size"] = int(payload.get("lot_size") or gm_cfg.get("lot_size") or 100)
+        kwargs["allow_closed_session"] = bool(
+            payload.get("allow_closed_session")
+            if payload.get("allow_closed_session") is not None
+            else gm_cfg.get("allow_closed_session", False)
+        )
+        mode = "gmtrade"
     return create_executor(mode, **kwargs)
 
 
@@ -2248,7 +2748,7 @@ def update_failure_state(state: Dict[str, Any], rules: Dict[str, Any], message: 
     state["consecutive_failures"] = int(state.get("consecutive_failures", 0)) + 1
     if state["consecutive_failures"] >= threshold:
         state["paused_until"] = (now_local(rules) + timedelta(minutes=pause_minutes)).isoformat()
-        send_feishu_text(
+        send_notification_text(
             f"[Trading] Consecutive failures reached {state['consecutive_failures']}."
             f" Trading is paused until {state['paused_until']}. Last error: {message}"
         )
@@ -2324,94 +2824,57 @@ def should_send_error_notification(state: Dict[str, Any], root_cfg: Dict[str, An
 
 def send_operator_notification(message: str, root_cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
     config = root_cfg or load_root_config()
-    gatekeeper_cfg = config.get("gatekeeper", {})
+    notification_cfg = config.get("notification", {})
+    if not notification_cfg.get("enabled", True):
+        return {"ok": False, "skipped": True, "reason": "notifications_disabled", "attempts": []}
+
+    runtime_cfg = load_openclaw_runtime_config()
     attempts: List[Dict[str, Any]] = []
 
-    feishu_targets = collect_feishu_targets(gatekeeper_cfg)
-    if feishu_targets:
-        target = feishu_targets[0]
-        result = send_native_feishu_text(target, message)
-        payload = result.get("payload", {}) if isinstance(result, dict) else {}
-        message_id = (
-            payload.get("payload", {})
-            .get("result", {})
-            .get("messageId")
-        )
+    discord_targets = collect_discord_targets(config, runtime_cfg)
+    discord_token = resolve_discord_bot_token(config, runtime_cfg)
+    if not discord_targets:
         attempts.append(
             {
-                "channel": "feishu",
+                "channel": "discord",
+                "target": "",
+                "ok": False,
+                "error": "discord_target_missing",
+            }
+        )
+        return {"ok": False, "attempts": attempts}
+
+    for target in discord_targets:
+        result = send_native_discord_text(target, message, discord_token)
+        payload = result.get("payload", {}) if isinstance(result, dict) else {}
+        attempts.append(
+            {
+                "channel": "discord",
                 "target": target,
                 "ok": bool(result.get("ok")),
-                "message_id": message_id or "",
+                "message_id": str(payload.get("id", "")).strip(),
+                "status_code": result.get("status_code"),
+                "error": str(result.get("error", "")).strip(),
             }
         )
         if result.get("ok"):
             return {
                 "ok": True,
-                "channel": "feishu",
+                "channel": "discord",
                 "target": target,
                 "attempts": attempts,
             }
-
-    webhook = str(gatekeeper_cfg.get("feishu", {}).get("webhook", "")).strip()
-    if webhook:
-        try:
-            import requests
-
-            first_line = message.split("\n", 1)[0] if message else ""
-            body_lines = message.split("\n")[1:] if "\n" in message else []
-            body_text = "\n".join(body_lines).strip()
-            card = {
-                "elements": [],
-            }
-            if first_line:
+            if False:
                 color = "red" if "异常" in first_line or "错误" in first_line else "blue"
                 card["header"] = {
                     "title": {"tag": "plain_text", "content": first_line},
                     "template": color,
                 }
-            if body_text:
-                card["elements"].append({
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": body_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
-                    },
-                })
-            response = requests.post(
-                webhook,
-                json={"msg_type": "interactive", "card": card},
-                timeout=8,
-            )
-            attempts.append(
-                {
-                    "channel": "feishu_webhook",
-                    "target": webhook,
-                    "ok": response.status_code == 200,
-                    "status_code": response.status_code,
-                }
-            )
-            if response.status_code == 200:
-                return {
-                    "ok": True,
-                    "channel": "feishu_webhook",
-                    "target": webhook,
-                    "attempts": attempts,
-                }
-        except Exception as exc:
-            attempts.append(
-                {
-                    "channel": "feishu_webhook",
-                    "target": webhook,
-                    "ok": False,
-                    "error": str(exc),
-                }
-            )
 
     return {"ok": False, "attempts": attempts}
 
 
-def send_feishu_text(message: str) -> None:
+def send_notification_text(message: str) -> None:
     send_operator_notification(message)
 
 
@@ -2565,8 +3028,6 @@ def approval_record_to_payload(record: Dict[str, Any], rules_file: str = "") -> 
         "market": metadata.get("market") or record.get("market"),
         "execution_mode": metadata.get("execution_mode") or record.get("execution_mode"),
         "broker_client": metadata.get("broker_client") or record.get("broker_client"),
-        "bridge_workspace": metadata.get("bridge_workspace") or record.get("bridge_workspace"),
-        "ths_exe_path": metadata.get("ths_exe_path") or record.get("ths_exe_path"),
     }
     if rules_file:
         payload["rules_file"] = rules_file
@@ -2588,7 +3049,9 @@ def persist_rejected_result(
         "status": status,
         "request_id": request_id,
         "symbol": payload.get("symbol"),
+        "market": infer_market(payload, rules, str(payload.get("symbol") or "")),
         "side": payload.get("side"),
+        "strategy_name": str(payload.get("strategy_name") or payload.get("strategy") or ""),
         "message": message,
         "details": details or {},
     }
@@ -2660,6 +3123,8 @@ def execute_approved_order(
         "symbol": symbol,
         "market": market,
         "side": side,
+        "strategy_name": strategy_name,
+        "strategy_kind": normalize_strategy_kind(payload.get("strategy_kind") or strategy_name),
         "quantity": quantity,
         "price": price,
         "leverage": leverage,
@@ -2844,29 +3309,41 @@ def action_get_portfolio_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
     executor_payload["market"] = market
     if symbol:
         executor_payload["symbol"] = symbol
+    execution_mode = execution_mode_for_market(market, executor_payload, rules, root_execution_config())
 
     balance: Dict[str, float] = {}
     positions: List[Any] = []
     connected = False
     error_message = ""
-    executor = build_executor(executor_payload, rules)
-    try:
-        connected = bool(executor.connect())
-        if not connected:
-            error_message = "Executor connection failed"
-        else:
-            balance = executor.get_balance() or {}
-            if include_positions:
-                positions = executor.get_positions() or []
-    except Exception as exc:
-        error_message = f"{type(exc).__name__}: {exc}"
-    finally:
+    if market == "cn_equity" and execution_mode in {"gm", "gmtrade"}:
+        probe_result = action_probe_gm_account(executor_payload)
+        connected = bool(probe_result.get("connected"))
+        error_message = str(probe_result.get("error") or "")
+        balance = dict(probe_result.get("balance") or {})
+        if include_positions:
+            positions = list(probe_result.get("positions") or [])
+    else:
+        executor = build_executor(executor_payload, rules)
         try:
-            executor.disconnect()
-        except Exception:
-            pass
+            connected = bool(executor.connect())
+            if not connected:
+                error_message = "Executor connection failed"
+            else:
+                balance = executor.get_balance() or {}
+                if include_positions:
+                    positions = executor.get_positions() or []
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                executor.disconnect()
+            except Exception:
+                pass
 
-    serialized_positions = [serialize_position_snapshot(position) for position in positions]
+    serialized_positions = [
+        position if isinstance(position, dict) else serialize_position_snapshot(position)
+        for position in positions
+    ]
     if not include_zero_positions:
         serialized_positions = [
             position for position in serialized_positions if abs(float(position.get("quantity") or 0)) > 0
@@ -2898,7 +3375,7 @@ def action_get_portfolio_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
         "symbol_hint": symbol,
         "connected": connected,
         "error": error_message,
-        "execution_mode": execution_mode_for_market(market, executor_payload, rules, root_execution_config()),
+        "execution_mode": execution_mode,
         "balance": balance_payload,
         "positions": serialized_positions[:max_positions],
         "tracked_positions": [
@@ -2957,10 +3434,11 @@ def action_get_review_universe(payload: Dict[str, Any]) -> Dict[str, Any]:
     rules = load_rules(payload)
     root_cfg = load_root_config()
     macro_state = load_macro_state(rules, root_cfg)
-    items = review_universe_items(rules, root_cfg)
+    requested_markets = requested_markets_from_payload(payload, review_markets_from_rules(rules))
+    items = review_universe_items(rules, root_cfg, requested_markets=requested_markets)
     market_sessions = {
         market: market_session_status(market, rules, root_cfg)
-        for market in review_markets_from_rules(rules)
+        for market in requested_markets
     }
     return {
         "ok": True,
@@ -2968,10 +3446,315 @@ def action_get_review_universe(payload: Dict[str, Any]) -> Dict[str, Any]:
         "risk_mode": macro_state.get("risk_mode"),
         "risk_regime": macro_state.get("risk_regime") or macro_state.get("risk_mode"),
         "trading": trading_runtime_config(rules, root_cfg),
-        "review_markets": review_markets_from_rules(rules),
+        "review_markets": requested_markets,
         "auto_execution_markets": auto_execution_markets_from_rules(rules),
         "market_sessions": market_sessions,
         "universe": items,
+    }
+
+
+def snapshot_position_quantity(symbol: str, market: str, positions: List[Dict[str, Any]] | None) -> float:
+    positions = positions or []
+    if market == "cn_equity":
+        target_code = extract_cn_equity_code(symbol)
+        for position in positions:
+            position_symbol = str((position or {}).get("symbol") or "").strip()
+            if target_code and extract_cn_equity_code(position_symbol) == target_code:
+                return float((position or {}).get("quantity") or 0.0)
+            if position_symbol == symbol:
+                return float((position or {}).get("quantity") or 0.0)
+        return 0.0
+
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_futures = normalize_futures_symbol(symbol).strip().upper()
+    base_asset = normalized_symbol.split("/", 1)[0] if "/" in normalized_symbol else normalized_symbol
+    for position in positions:
+        position_symbol = str((position or {}).get("symbol") or "").strip().upper()
+        if not position_symbol:
+            continue
+        if position_symbol in {normalized_symbol, normalized_futures, base_asset}:
+            return float((position or {}).get("quantity") or 0.0)
+        if position_symbol.startswith(f"{base_asset}:"):
+            return float((position or {}).get("quantity") or 0.0)
+        if ":" in position_symbol and position_symbol.split(":", 1)[0] in {normalized_symbol, normalized_futures}:
+            return float((position or {}).get("quantity") or 0.0)
+    return 0.0
+
+
+def describe_position_state(symbol: str, market: str, quantity: float) -> str:
+    quantity = float(quantity or 0.0)
+    if abs(quantity) <= 0:
+        return "No position."
+    if market == "cn_equity":
+        return f"Existing position {int(quantity)} shares unchanged."
+    base_asset = str(symbol or "").split("/", 1)[0]
+    return f"Existing position {quantity:g} {base_asset} unchanged."
+
+
+def build_review_message(
+    *,
+    symbol: str,
+    strategy_name: str,
+    signal: str,
+    reason: str,
+    execution_allowed: bool,
+    execution_block_reason: str,
+    position_quantity: float,
+    market: str,
+) -> str:
+    decision = str(signal or "hold").upper()
+    reason_text = " ".join(str(reason or "").split()).strip().rstrip(".")
+    execution_text = (
+        "Execution allowed."
+        if execution_allowed
+        else f"Execution blocked: {' '.join(str(execution_block_reason or 'execution disabled').split()).strip().rstrip('.') }."
+    )
+    return (
+        f"{symbol} {decision}: {strategy_name} {reason_text}. "
+        f"{execution_text} {describe_position_state(symbol, market, position_quantity)}"
+    )
+
+
+def action_run_market_review_once(payload: Dict[str, Any]) -> Dict[str, Any]:
+    rules = load_rules(payload)
+    root_cfg = load_root_config()
+    requested_markets = requested_markets_from_payload(payload, review_markets_from_rules(rules))
+    refresh_macro_if_stale = bool(payload.get("refresh_macro_if_stale", True))
+    compact = bool(payload.get("compact", False))
+
+    trading_state = action_get_trading_state(payload)
+    macro_state = trading_state.get("macro_state", {}) or {}
+    macro_refreshed = False
+    if refresh_macro_if_stale and bool(macro_state.get("stale")):
+        action_update_macro_state(payload)
+        macro_refreshed = True
+
+    review_payload = dict(payload)
+    review_payload["markets"] = requested_markets
+    universe_result = action_get_review_universe(review_payload)
+    universe = list(universe_result.get("universe") or [])
+
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    for market in requested_markets:
+        try:
+            snapshots[market] = action_get_portfolio_snapshot(
+                {
+                    **payload,
+                    "market": market,
+                    "include_positions": True,
+                    "max_positions": 200,
+                }
+            )
+        except Exception as exc:
+            snapshots[market] = {
+                "ok": False,
+                "market": market,
+                "connected": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "positions": [],
+                "tracked_positions": [],
+            }
+
+    results: List[Dict[str, Any]] = []
+    executed = 0
+    blocked = 0
+    held = 0
+    failed = 0
+
+    for item in universe:
+        symbol = str(item.get("symbol") or "").strip()
+        market = str(item.get("market") or "").strip().lower()
+        interval = str(item.get("timeframe") or "")
+        lookback = int(item.get("lookback") or 0)
+        snapshot = snapshots.get(market, {})
+        snapshot_positions = list(snapshot.get("positions") or [])
+        position_quantity = snapshot_position_quantity(symbol, market, snapshot_positions)
+
+        try:
+            market_data_result = action_get_market_data(
+                {
+                    **payload,
+                    "symbol": symbol,
+                    "market": market,
+                    "interval": interval,
+                    "lookback": lookback,
+                    "compact": compact,
+                }
+            )
+            signal_result = action_generate_signal(
+                {
+                    **payload,
+                    "symbol": symbol,
+                    "market": market,
+                    "interval": interval,
+                    "lookback": lookback,
+                    "market_data": market_data_result.get("market_data"),
+                }
+            )
+        except Exception as exc:
+            failed += 1
+            error_text = f"{type(exc).__name__}: {exc}"
+            action_record_trading_decision(
+                {
+                    "symbol": symbol,
+                    "market": market,
+                    "side": "hold",
+                    "status": "failed",
+                    "strategy_name": str(item.get("strategy_name") or strategy_name_for_symbol(symbol, rules, {"symbol": symbol, "market": market})),
+                    "strategy_kind": normalize_strategy_kind(
+                        item.get("strategy_kind")
+                        or item.get("strategy_name")
+                        or strategy_name_for_symbol(symbol, rules, {"symbol": symbol, "market": market})
+                    ),
+                    "message": f"{symbol} review failed: {error_text}",
+                    "details": {
+                        "market": market,
+                        "interval": interval,
+                        "lookback": lookback,
+                    },
+                }
+            )
+            results.append(
+                {
+                    "symbol": symbol,
+                    "market": market,
+                    "status": "failed",
+                    "error": error_text,
+                }
+            )
+            continue
+
+        signal = str(signal_result.get("signal") or "HOLD").strip().lower()
+        strategy_name = str(signal_result.get("strategy_name") or "unknown")
+        strategy_kind = str(signal_result.get("strategy_kind") or normalize_strategy_kind(strategy_name))
+        reason = str(signal_result.get("reason") or "").strip()
+        execution_allowed = bool(signal_result.get("execution_allowed"))
+        session_reason = str((signal_result.get("market_session") or {}).get("reason") or "").strip()
+        price = safe_float(signal_result.get("price"))
+        details = {
+            "final_decision": signal,
+            "signal": signal,
+            "strategy_name": strategy_name,
+            "strategy_kind": strategy_kind,
+            "execution_allowed": execution_allowed,
+            "market": market,
+            "price": price,
+            "reason": reason,
+            "source": market_data_result.get("source"),
+            "latest_timestamp": market_data_result.get("latest_timestamp"),
+            "position_check": {
+                "has_position": abs(position_quantity) > 0,
+                "position_quantity": position_quantity,
+            },
+        }
+
+        indicators = dict(signal_result.get("indicators") or {})
+        trimmed_indicators = {
+            key: indicators.get(key)
+            for key in (
+                "rsi",
+                "ma_fast",
+                "ma_slow",
+                "bb_upper",
+                "bb_lower",
+                "ema_fast",
+                "ema_slow",
+                "atr",
+                "vote_totals",
+                "strategy_votes",
+                "breakout_level",
+                "breakdown_level",
+            )
+            if key in indicators
+        }
+        if trimmed_indicators:
+            details["indicators"] = trimmed_indicators
+        if indicators.get("vote_totals") is not None:
+            details["vote_totals"] = indicators.get("vote_totals")
+
+        if signal == "hold" or not execution_allowed:
+            held += 1
+            execution_block_reason = ""
+            if not execution_allowed:
+                execution_block_reason = session_reason or "execution disabled for this market"
+                details["execution_block_reason"] = execution_block_reason
+
+            message = build_review_message(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                signal=signal,
+                reason=reason,
+                execution_allowed=execution_allowed,
+                execution_block_reason=execution_block_reason,
+                position_quantity=position_quantity,
+                market=market,
+            )
+            action_record_trading_decision(
+                {
+                    "symbol": symbol,
+                    "market": market,
+                    "side": "hold",
+                    "status": "hold",
+                    "strategy_name": strategy_name,
+                    "strategy_kind": strategy_kind,
+                    "message": message,
+                    "details": details,
+                }
+            )
+            results.append(
+                {
+                    "symbol": symbol,
+                    "market": market,
+                    "status": "hold",
+                    "signal": signal.upper(),
+                    "message": message,
+                    "price": price,
+                }
+            )
+            continue
+
+        order_payload = {
+            **payload,
+            "symbol": symbol,
+            "market": market,
+            "side": signal,
+            "quantity": signal_result.get("quantity"),
+            "price": price,
+            "reason": reason,
+            "strategy": strategy_name,
+            "strategy_name": strategy_name,
+            "strategy_kind": strategy_kind,
+            "interval": interval,
+            "lookback": lookback,
+        }
+        order_result = action_place_order(order_payload)
+        if order_result.get("executed"):
+            executed += 1
+            outcome = "executed"
+        else:
+            blocked += 1
+            outcome = "blocked"
+        results.append(
+            {
+                "symbol": symbol,
+                "market": market,
+                "status": outcome,
+                "signal": signal.upper(),
+                "price": price,
+                "order_result": to_jsonable(order_result),
+            }
+        )
+
+    return {
+        "ok": True,
+        "requested_markets": requested_markets,
+        "macro_refreshed": macro_refreshed,
+        "review_count": len(universe),
+        "held": held,
+        "executed": executed,
+        "blocked": blocked,
+        "failed": failed,
+        "results": results,
     }
 
 
@@ -3185,18 +3968,447 @@ def action_calculate_indicator(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "indicator": indicator, "indicators": result}
 
 
+def evaluate_trend_following_signal(
+    strategy_cfg: Dict[str, Any],
+    indicators: Dict[str, Any],
+    quantity: float | str,
+    scale: float,
+    df: pd.DataFrame | None = None,
+    higher_tf_df: pd.DataFrame | None = None,
+    market: str = "",
+) -> tuple[str, str, float | str]:
+    fast_prev = float(indicators["ema_fast_prev"])
+    fast_now = float(indicators["ema_fast"])
+    slow_prev = float(indicators["ema_slow_prev"])
+    slow_now = float(indicators["ema_slow"])
+    rsi_value = float(indicators["rsi"]) if indicators.get("rsi") is not None else 50.0
+    buy_rsi_below = float(strategy_cfg.get("buy_rsi_below", 70))
+    sell_rsi_above = float(strategy_cfg.get("sell_rsi_above", 85))
+    golden_cross = fast_prev <= slow_prev and fast_now > slow_now
+    death_cross = fast_prev >= slow_prev and fast_now < slow_now
+    higher_trend_ok = True
+    higher_tf_ema = None
+    use_higher_tf_filter = market == "cn_equity" and bool(strategy_cfg.get("use_higher_timeframe_filter", False))
+    higher_tf_period = max(int(strategy_cfg.get("higher_timeframe_ema_period", 13) or 13), 1)
 
-# evaluate_trend_following_signal: moved to kernel/strategy/trend_following.py
-# evaluate_mean_reversion_signal: moved to kernel/strategy/mean_reversion.py
-# evaluate_combined_signal: moved to kernel/strategy/combined.py
-# All three are now called via kernel_evaluate_signal() from kernel/strategy/registry.py
+    if use_higher_tf_filter and higher_tf_df is not None and not higher_tf_df.empty and len(higher_tf_df) >= higher_tf_period:
+        higher_close = pd.to_numeric(higher_tf_df["close"], errors="coerce")
+        higher_ema_series = higher_close.ewm(span=higher_tf_period, adjust=False).mean()
+        higher_tf_ema = float(higher_ema_series.iloc[-1])
+        higher_trend_ok = float(higher_close.iloc[-1]) > higher_tf_ema
+
+    indicators["higher_trend_ok"] = higher_trend_ok
+    indicators["higher_tf_ema"] = higher_tf_ema
+
+    if golden_cross and rsi_value < buy_rsi_below and higher_trend_ok:
+        if float(quantity) <= 0:
+            return (
+                "hold",
+                f"Trend-following buy signal fired but scaled quantity rounded to zero after macro position scale {scale:.2f}",
+                quantity,
+            )
+        return (
+            "buy",
+            f"Trend-following entry: EMA{strategy_cfg['ema_fast_period']} crossed above EMA{strategy_cfg['ema_slow_period']}, RSI {rsi_value:.2f} < {buy_rsi_below:.2f}, higher timeframe aligned",
+            quantity,
+        )
+    if death_cross or rsi_value > sell_rsi_above:
+        if strategy_cfg.get("sell_all_on_exit", True):
+            quantity = "ALL"
+        return (
+            "sell",
+            f"Trend-following exit: death_cross={death_cross} or RSI {rsi_value:.2f} > {sell_rsi_above:.2f}",
+            quantity,
+        )
+    return (
+        "hold",
+        f"No configured rule fired; EMA{strategy_cfg['ema_fast_period']}={indicators['ema_fast']:.2f}, EMA{strategy_cfg['ema_slow_period']}={indicators['ema_slow']:.2f}, RSI {rsi_value:.2f}, higher timeframe ok={higher_trend_ok}",
+        quantity,
+    )
 
 
+def evaluate_mean_reversion_signal(
+    strategy_cfg: Dict[str, Any],
+    indicators: Dict[str, Any],
+    quantity: float | str,
+    scale: float,
+) -> tuple[str, str, float | str]:
+    close = float(indicators["close"])
+    rsi_value = float(indicators["rsi"]) if indicators.get("rsi") is not None else 50.0
+    bb_lower = safe_float(indicators.get("bb_lower"))
+    bb_upper = safe_float(indicators.get("bb_upper"))
+    bb_middle = safe_float(indicators.get("bb_middle"))
+    if bb_lower is None or bb_upper is None or bb_middle is None:
+        return ("hold", "Mean-reversion signal skipped because Bollinger bands are incomplete", quantity)
+
+    buy_rsi_below = float(strategy_cfg.get("buy_rsi_below", 38))
+    sell_rsi_above = float(strategy_cfg.get("sell_rsi_above", 68))
+    midline_exit_rsi_above = float(strategy_cfg.get("midline_exit_rsi_above", 52))
+    touched_lower = close <= bb_lower
+    touched_upper = close >= bb_upper
+    crossed_midline = bool(strategy_cfg.get("exit_on_midline", True)) and close >= bb_middle
+
+    if touched_lower and rsi_value <= buy_rsi_below:
+        if float(quantity) <= 0:
+            return (
+                "hold",
+                f"Mean-reversion buy signal fired but scaled quantity rounded to zero after macro position scale {scale:.2f}",
+                quantity,
+            )
+        return (
+            "buy",
+            f"Mean-reversion entry: close {close:.2f} touched lower band {bb_lower:.2f} and RSI {rsi_value:.2f} <= {buy_rsi_below:.2f}",
+            quantity,
+        )
+    if touched_upper and rsi_value >= sell_rsi_above:
+        if strategy_cfg.get("sell_all_on_exit", True):
+            quantity = "ALL"
+        return (
+            "sell",
+            f"Mean-reversion exit: close {close:.2f} reached upper band {bb_upper:.2f} and RSI {rsi_value:.2f} >= {sell_rsi_above:.2f}",
+            quantity,
+        )
+    if crossed_midline and rsi_value >= midline_exit_rsi_above:
+        if strategy_cfg.get("sell_all_on_exit", True):
+            quantity = "ALL"
+        return (
+            "sell",
+            f"Mean-reversion take-profit: close {close:.2f} recovered above middle band {bb_middle:.2f} and RSI {rsi_value:.2f} >= {midline_exit_rsi_above:.2f}",
+            quantity,
+        )
+    return (
+        "hold",
+        f"No configured rule fired; close {close:.2f}, BB[{bb_lower:.2f}, {bb_middle:.2f}, {bb_upper:.2f}], RSI {rsi_value:.2f}",
+        quantity,
+    )
 
 
+def trend_following_signal(df: pd.DataFrame, params: Dict[str, Any]) -> tuple[str, str, Dict[str, Any]]:
+    strategy_cfg = canonicalize_strategy_config(params)
+    fast = max(int(strategy_cfg.get("ema_fast_period", strategy_cfg.get("fast", 5)) or 5), 1)
+    slow = max(int(strategy_cfg.get("ema_slow_period", strategy_cfg.get("slow", 20)) or 20), fast + 1)
+    atr_period = max(int(strategy_cfg.get("atr_period", 14) or 14), 1)
+    atr_multiplier = float(strategy_cfg.get("atr_multiplier", 2.0) or 2.0)
+    trend_filter_period = max(int(strategy_cfg.get("trend_filter_ema_period", strategy_cfg.get("trend_ema_period", 200)) or 200), 1)
+    required_rows = max(fast, slow, atr_period, trend_filter_period if strategy_cfg.get("use_trend_filter", False) else 0) + 2
+    if df is None or df.empty or len(df) < required_rows:
+        return (
+            "HOLD",
+            f"Trend-following needs at least {required_rows} rows; only {0 if df is None else len(df)} available",
+            {},
+        )
+
+    close = pd.to_numeric(df["close"], errors="coerce")
+    fast_ma = close.rolling(fast).mean()
+    slow_ma = close.rolling(slow).mean()
+    atr = atr_series(df, atr_period)
+    if any(pd.isna(value) for value in (fast_ma.iloc[-2], fast_ma.iloc[-1], slow_ma.iloc[-2], slow_ma.iloc[-1])):
+        return ("HOLD", "Trend-following skipped because moving averages are incomplete", {})
+
+    current_atr = float(atr.iloc[-1]) if not atr.empty and not pd.isna(atr.iloc[-1]) else 0.0
+    trend_filter_ok = True
+    trend_filter_value = None
+    if strategy_cfg.get("use_trend_filter", False):
+        trend_ema = close.ewm(span=trend_filter_period, adjust=False).mean()
+        trend_filter_value = float(trend_ema.iloc[-1])
+        trend_filter_ok = float(close.iloc[-1]) >= trend_filter_value
+        if not trend_filter_ok:
+            return (
+                "HOLD",
+                f"Price {float(close.iloc[-1]):.2f} is below EMA{trend_filter_period} {trend_filter_value:.2f}",
+                {
+                    "trend_filter_ema": trend_filter_value,
+                    "atr": current_atr,
+                },
+            )
+
+    golden_cross = float(fast_ma.iloc[-2]) <= float(slow_ma.iloc[-2]) and float(fast_ma.iloc[-1]) > float(slow_ma.iloc[-1])
+    death_cross = float(fast_ma.iloc[-2]) >= float(slow_ma.iloc[-2]) and float(fast_ma.iloc[-1]) < float(slow_ma.iloc[-1])
+    if golden_cross:
+        stop_loss = float(close.iloc[-1]) - (atr_multiplier * current_atr)
+        return (
+            "BUY",
+            f"Golden cross with SMA{fast}/SMA{slow}; ATR stop {stop_loss:.2f}",
+            {
+                "stop_loss": stop_loss,
+                "atr": current_atr,
+                "trend_filter_ema": trend_filter_value,
+                "golden_cross": True,
+                "death_cross": False,
+            },
+        )
+    if death_cross:
+        return (
+            "SELL",
+            f"Death cross with SMA{fast}/SMA{slow}",
+            {
+                "atr": current_atr,
+                "trend_filter_ema": trend_filter_value,
+                "golden_cross": False,
+                "death_cross": True,
+            },
+        )
+    return (
+        "HOLD",
+        f"No cross; SMA{fast}={float(fast_ma.iloc[-1]):.2f}, SMA{slow}={float(slow_ma.iloc[-1]):.2f}",
+        {
+            "atr": current_atr,
+            "trend_filter_ema": trend_filter_value,
+            "golden_cross": False,
+            "death_cross": False,
+        },
+    )
 
 
+def mean_reversion_signal(df: pd.DataFrame, params: Dict[str, Any]) -> tuple[str, str, Dict[str, Any]]:
+    strategy_cfg = canonicalize_strategy_config(params)
+    bb_period = max(int(strategy_cfg.get("bb_period", 20) or 20), 1)
+    bb_std = float(strategy_cfg.get("bb_stddev", strategy_cfg.get("bb_std", 2.0)) or 2.0)
+    rsi_period = max(int(strategy_cfg.get("rsi_period", 14) or 14), 1)
+    rsi_oversold = float(strategy_cfg.get("buy_rsi_below", strategy_cfg.get("rsi_oversold", 30)) or 30)
+    rsi_overbought = float(strategy_cfg.get("sell_rsi_above", strategy_cfg.get("rsi_overbought", 70)) or 70)
+    required_rows = max(bb_period, rsi_period) + 2
+    if df is None or df.empty or len(df) < required_rows:
+        return (
+            "HOLD",
+            f"Mean-reversion needs at least {required_rows} rows; only {0 if df is None else len(df)} available",
+            {},
+        )
 
+    close = pd.to_numeric(df["close"], errors="coerce")
+    middle = close.rolling(bb_period).mean()
+    std = close.rolling(bb_period).std()
+    upper = middle + (bb_std * std)
+    lower = middle - (bb_std * std)
+    rsi = rsi_series(close, rsi_period)
+    if any(pd.isna(value) for value in (upper.iloc[-1], lower.iloc[-1], middle.iloc[-1], rsi.iloc[-1])):
+        return ("HOLD", "Mean-reversion skipped because Bollinger or RSI values are incomplete", {})
+
+    current_close = float(close.iloc[-1])
+    current_rsi = float(rsi.iloc[-1])
+    current_upper = float(upper.iloc[-1])
+    current_lower = float(lower.iloc[-1])
+    current_middle = float(middle.iloc[-1])
+    if current_close <= current_lower and current_rsi < rsi_oversold:
+        return (
+            "BUY",
+            f"Price touched lower band {current_lower:.2f} with RSI {current_rsi:.1f}",
+            {
+                "bb_upper": current_upper,
+                "bb_middle": current_middle,
+                "bb_lower": current_lower,
+                "rsi": current_rsi,
+            },
+        )
+    if current_close >= current_upper and current_rsi > rsi_overbought:
+        return (
+            "SELL",
+            f"Price touched upper band {current_upper:.2f} with RSI {current_rsi:.1f}",
+            {
+                "bb_upper": current_upper,
+                "bb_middle": current_middle,
+                "bb_lower": current_lower,
+                "rsi": current_rsi,
+            },
+        )
+    return (
+        "HOLD",
+        f"Within bands; close {current_close:.2f}, RSI {current_rsi:.1f}",
+        {
+            "bb_upper": current_upper,
+            "bb_middle": current_middle,
+            "bb_lower": current_lower,
+            "rsi": current_rsi,
+        },
+    )
+
+
+def breakout_signal(df: pd.DataFrame, params: Dict[str, Any]) -> tuple[str, str, Dict[str, Any]]:
+    strategy_cfg = canonicalize_strategy_config(params)
+    lookback_high = max(int(strategy_cfg.get("lookback_high", 20) or 20), 1)
+    lookback_low = max(int(strategy_cfg.get("lookback_low", 10) or 10), 1)
+    atr_period = max(int(strategy_cfg.get("atr_period", 14) or 14), 1)
+    atr_stop_multiplier = float(strategy_cfg.get("atr_stop_multiplier", strategy_cfg.get("atr_multiplier", 2.0)) or 2.0)
+    required_rows = max(lookback_high, lookback_low, atr_period) + 2
+    if df is None or df.empty or len(df) < required_rows:
+        return (
+            "HOLD",
+            f"Breakout needs at least {required_rows} rows; only {0 if df is None else len(df)} available",
+            {},
+        )
+
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    highest_high = high.rolling(lookback_high).max()
+    lowest_low = low.rolling(lookback_low).min()
+    atr = atr_series(df, atr_period)
+    if any(pd.isna(value) for value in (highest_high.iloc[-2], lowest_low.iloc[-2], close.iloc[-1])):
+        return ("HOLD", "Breakout skipped because Donchian bands are incomplete", {})
+
+    current_close = float(close.iloc[-1])
+    breakout_level = float(highest_high.iloc[-2])
+    stop_level = float(lowest_low.iloc[-2])
+    current_atr = float(atr.iloc[-1]) if not atr.empty and not pd.isna(atr.iloc[-1]) else 0.0
+    if current_close > breakout_level:
+        stop_loss = current_close - (atr_stop_multiplier * current_atr)
+        return (
+            "BUY",
+            f"Breakout above {lookback_high}-period high {breakout_level:.2f}",
+            {
+                "breakout_level": breakout_level,
+                "breakdown_level": stop_level,
+                "atr": current_atr,
+                "stop_loss": stop_loss,
+            },
+        )
+    if current_close < stop_level:
+        return (
+            "SELL",
+            f"Breakdown below {lookback_low}-period low {stop_level:.2f}",
+            {
+                "breakout_level": breakout_level,
+                "breakdown_level": stop_level,
+                "atr": current_atr,
+            },
+        )
+    return (
+        "HOLD",
+        f"No breakout; close {current_close:.2f}, range [{stop_level:.2f}, {breakout_level:.2f}]",
+        {
+            "breakout_level": breakout_level,
+            "breakdown_level": stop_level,
+            "atr": current_atr,
+        },
+    )
+
+
+def evaluate_component_strategy_signal(
+    strategy_cfg: Dict[str, Any],
+    df: pd.DataFrame,
+    quantity: float | str,
+    scale: float,
+) -> Dict[str, Any]:
+    kind = normalize_strategy_kind(strategy_cfg.get("kind") or strategy_cfg.get("name"))
+    if kind == "trend_following":
+        signal, reason, metadata = trend_following_signal(df, strategy_cfg)
+    elif kind == "mean_reversion":
+        signal, reason, metadata = mean_reversion_signal(df, strategy_cfg)
+    elif kind == "breakout":
+        signal, reason, metadata = breakout_signal(df, strategy_cfg)
+    else:
+        signal, reason, metadata = "HOLD", f"Unsupported strategy kind {kind}", {}
+
+    resolved_quantity: float | str = quantity
+    numeric_quantity = safe_float(quantity)
+    if signal == "BUY" and (numeric_quantity is None or numeric_quantity <= 0):
+        signal = "HOLD"
+        reason = f"{reason}; scaled quantity rounded to zero after macro position scale {scale:.2f}"
+    elif signal == "SELL" and strategy_cfg.get("sell_all_on_exit", True):
+        resolved_quantity = "ALL"
+
+    return {
+        "strategy_name": str(strategy_cfg.get("name") or kind),
+        "strategy_kind": kind,
+        "signal": signal,
+        "signal_lower": signal.lower(),
+        "reason": reason,
+        "quantity": resolved_quantity,
+        "metadata": metadata,
+    }
+
+
+def evaluate_breakout_signal(
+    strategy_cfg: Dict[str, Any],
+    indicators: Dict[str, Any],
+    quantity: float | str,
+    scale: float,
+    df: pd.DataFrame | None = None,
+) -> tuple[str, str, float | str]:
+    if df is None or df.empty:
+        return ("hold", "Breakout signal skipped because market data is unavailable", quantity)
+    component_result = evaluate_component_strategy_signal(strategy_cfg, df, quantity, scale)
+    indicators.update(component_result.get("metadata") or {})
+    return (
+        component_result["signal_lower"],
+        component_result["reason"],
+        component_result["quantity"],
+    )
+
+
+def evaluate_dynamic_signal(
+    *,
+    symbol: str,
+    market: str,
+    rules: Dict[str, Any],
+    strategy_cfg: Dict[str, Any],
+    df: pd.DataFrame,
+    quantity: float | str,
+    scale: float,
+) -> tuple[str, str, float | str, Dict[str, Any]]:
+    components, weights = dynamic_component_configs(rules, strategy_cfg)
+    vote_totals = {"BUY": 0.0, "SELL": 0.0, "HOLD": 0.0}
+    total_weight = 0.0
+    component_results: Dict[str, Dict[str, Any]] = {}
+
+    for name, component_cfg in components.items():
+        weight = max(float(weights.get(name, 1.0) or 0.0), 0.0)
+        if weight <= 0:
+            continue
+        result = evaluate_component_strategy_signal(component_cfg, df, quantity, scale)
+        vote_totals[result["signal"]] += weight
+        total_weight += weight
+        component_results[name] = {
+            "signal": result["signal"],
+            "reason": result["reason"],
+            "weight": weight,
+            "quantity": result["quantity"],
+            "metadata": result.get("metadata") or {},
+        }
+
+    if not component_results:
+        return (
+            "hold",
+            "Dynamic strategy has no enabled component definitions",
+            quantity,
+            {"strategy_votes": {}, "vote_totals": vote_totals},
+        )
+
+    buy_weight = vote_totals["BUY"]
+    sell_weight = vote_totals["SELL"]
+    hold_weight = vote_totals["HOLD"]
+    if buy_weight > max(sell_weight, hold_weight):
+        final_signal = "BUY"
+    elif sell_weight > max(buy_weight, hold_weight):
+        final_signal = "SELL"
+    else:
+        final_signal = "HOLD"
+
+    signal_map = ", ".join(
+        f"{name}={details['signal']}({details['weight']:.2f})"
+        for name, details in component_results.items()
+    )
+    final_reason = f"Vote: {final_signal} (buy={buy_weight:.2f}, sell={sell_weight:.2f}, hold={hold_weight:.2f}; {signal_map})"
+    final_quantity: float | str = quantity
+    if final_signal == "SELL":
+        sell_results = [details for details in component_results.values() if details["signal"] == "SELL"]
+        if any(str(details.get("quantity")).strip().upper() == "ALL" for details in sell_results):
+            final_quantity = "ALL"
+        elif sell_results:
+            final_quantity = sell_results[0]["quantity"]
+
+    return (
+        final_signal.lower(),
+        final_reason,
+        final_quantity,
+        {
+            "strategy_votes": component_results,
+            "vote_totals": vote_totals,
+            "vote_position_scale": float(max(buy_weight, sell_weight, hold_weight) / total_weight) if total_weight > 0 else 0.0,
+            "symbol": symbol,
+            "market": market,
+        },
+    )
 
 
 def stop_loss_signal_for_symbol(
@@ -3254,6 +4466,83 @@ def stop_loss_signal_for_symbol(
     )
 
 
+def evaluate_combined_signal(
+    strategy_cfg: Dict[str, Any],
+    indicators: Dict[str, Any],
+    quantity: float | str,
+    scale: float,
+    df: pd.DataFrame | None = None,
+    higher_tf_df: pd.DataFrame | None = None,
+) -> tuple[str, str, float | str]:
+    fast_prev = float(indicators["ma_fast_prev"])
+    fast_now = float(indicators["ma_fast"])
+    slow_prev = float(indicators["ma_slow_prev"])
+    slow_now = float(indicators["ma_slow"])
+    rsi_value = float(indicators["rsi"]) if indicators.get("rsi") is not None else 50.0
+    rsi_upper = float(strategy_cfg.get("rsi_upper", 70))
+    rsi_lower = float(strategy_cfg.get("rsi_lower", 30))
+    golden_cross = fast_prev <= slow_prev and fast_now > slow_now
+    death_cross = fast_prev >= slow_prev and fast_now < slow_now
+
+    trend_filter_period = max(int(strategy_cfg.get("trend_filter_ema_period", 200) or 200), 1)
+    volume_lookback = max(int(strategy_cfg.get("volume_lookback", 20) or 20), 1)
+    volume_multiplier = float(strategy_cfg.get("volume_multiplier", 1.5) or 1.5)
+    higher_tf_period = max(int(strategy_cfg.get("higher_timeframe_ema_period", 50) or 50), 1)
+
+    above_200ema = True
+    ema200_value = None
+    if df is not None and not df.empty and len(df) >= trend_filter_period:
+        ema200 = pd.to_numeric(df["close"], errors="coerce").ewm(span=trend_filter_period, adjust=False).mean()
+        ema200_value = float(ema200.iloc[-1])
+        above_200ema = float(df["close"].iloc[-1]) > ema200_value
+
+    volume_ok = True
+    average_volume = None
+    current_volume = None
+    if df is not None and not df.empty and golden_cross and len(df) >= volume_lookback:
+        volume_series = pd.to_numeric(df["volume"], errors="coerce")
+        average_volume = float(volume_series.tail(volume_lookback).mean())
+        current_volume = float(volume_series.iloc[-1])
+        volume_ok = current_volume > (average_volume * volume_multiplier)
+
+    higher_trend_ok = True
+    higher_ema_value = None
+    if higher_tf_df is not None and not higher_tf_df.empty and len(higher_tf_df) >= higher_tf_period:
+        higher_close = pd.to_numeric(higher_tf_df["close"], errors="coerce")
+        higher_ema = higher_close.ewm(span=higher_tf_period, adjust=False).mean()
+        higher_ema_value = float(higher_ema.iloc[-1])
+        higher_trend_ok = float(higher_close.iloc[-1]) > higher_ema_value
+
+    indicators["trend_filter_above_ema"] = above_200ema
+    indicators["trend_filter_ema_value"] = ema200_value
+    indicators["volume_confirmation"] = volume_ok
+    indicators["avg_volume"] = average_volume
+    indicators["current_volume"] = current_volume
+    indicators["higher_trend_ok"] = higher_trend_ok
+    indicators["higher_tf_ema"] = higher_ema_value
+
+    if golden_cross and rsi_value <= rsi_upper and above_200ema and volume_ok and higher_trend_ok:
+        if float(quantity) <= 0:
+            return (
+                "hold",
+                f"Combined-strategy buy signal fired but scaled quantity rounded to zero after position scale {scale:.2f}",
+                quantity,
+            )
+        return (
+            "buy",
+            f"Enhanced combined entry: MA{strategy_cfg['fast']} crossed above MA{strategy_cfg['slow']}, RSI {rsi_value:.2f} <= {rsi_upper:.2f}, price above EMA{trend_filter_period}, volume confirmed, higher timeframe aligned",
+            quantity,
+        )
+    if death_cross or rsi_value >= rsi_upper:
+        if strategy_cfg.get("sell_all_on_exit", True):
+            quantity = "ALL"
+        trigger = "death_cross" if death_cross else f"RSI {rsi_value:.2f} >= {rsi_upper:.2f}"
+        return ("sell", f"Enhanced combined exit: {trigger}", quantity)
+    return (
+        "hold",
+        f"No configured rule fired; MA{strategy_cfg['fast']}={indicators['ma_fast']:.2f}, MA{strategy_cfg['slow']}={indicators['ma_slow']:.2f}, RSI {rsi_value:.2f}, oversold guard {rsi_lower:.2f}",
+        quantity,
+    )
 
 
 def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3289,15 +4578,8 @@ def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     settings = market_settings_for_symbol(symbol, rules, payload)
     interval = payload.get("interval") or settings.get("timeframe") or rules.get("agent", {}).get("timeframe", "1h")
     lookback = int(payload.get("lookback") or settings.get("lookback") or rules.get("agent", {}).get("lookback", 100))
-    strategy_kind = str(strategy_cfg.get("kind") or "trend_following")
-    required_lookback = lookback
-    if strategy_kind == "combined":
-        required_lookback = max(
-            required_lookback,
-            int(strategy_cfg.get("trend_filter_ema_period", 200) or 200) + 5,
-            int(strategy_cfg.get("volume_lookback", 20) or 20) + 5,
-            int(strategy_cfg.get("atr_period", 14) or 14) + 10,
-        )
+    strategy_kind = normalize_strategy_kind(strategy_cfg.get("kind") or "trend_following")
+    required_lookback = strategy_required_lookback(strategy_cfg, lookback, rules)
 
     candles = payload.get("market_data")
     if candles and len(candles) >= min(required_lookback, 30):
@@ -3313,7 +4595,13 @@ def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     quantity: float | str = suggested_buy_quantity(symbol, market, rules, root_cfg, {"symbol": symbol, "market": market})
     session_status = market_session_status(market, rules, root_cfg)
     configured_execution_allowed = market in auto_execution_markets_from_rules(rules)
-    execution_allowed = configured_execution_allowed and bool(session_status.get("execution_allowed", True))
+    execution_mode = execution_mode_for_market(market, {"symbol": symbol, "market": market}, rules, root_execution_config())
+    execution_allowed = configured_execution_allowed and session_execution_allowed_for_mode(
+        market,
+        session_status,
+        execution_mode,
+        root_execution_config(),
+    )
     strategy_name = str(strategy_cfg.get("name") or strategy_kind)
     higher_tf_df = None
     if strategy_kind == "combined" and bool(strategy_cfg.get("use_4h_filter", False)):
@@ -3343,10 +4631,41 @@ def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     stop_loss_override = stop_loss_signal_for_symbol(symbol, market, df, rules)
     if stop_loss_override is not None:
         signal, reason, quantity = stop_loss_override
+        dynamic_details: Dict[str, Any] = {}
+    elif strategy_kind == "dynamic":
+        signal, reason, quantity, dynamic_details = evaluate_dynamic_signal(
+            symbol=symbol,
+            market=market,
+            rules=rules,
+            strategy_cfg=strategy_cfg,
+            df=df,
+            quantity=quantity,
+            scale=scale,
+        )
+    elif strategy_kind == "mean_reversion":
+        signal, reason, quantity = evaluate_mean_reversion_signal(strategy_cfg, indicators, quantity, scale)
+        dynamic_details = {}
+    elif strategy_kind == "combined":
+        signal, reason, quantity = evaluate_combined_signal(
+            strategy_cfg,
+            indicators,
+            quantity,
+            scale,
+            df=df,
+            higher_tf_df=higher_tf_df,
+        )
+        dynamic_details = {}
+    elif strategy_kind == "breakout":
+        signal, reason, quantity = evaluate_breakout_signal(
+            strategy_cfg,
+            indicators,
+            quantity,
+            scale,
+            df=df,
+        )
+        dynamic_details = {}
     else:
-        # Use kernel pure functions for signal evaluation
-        signal, reason, quantity = kernel_evaluate_signal(
-            strategy_kind,
+        signal, reason, quantity = evaluate_trend_following_signal(
             strategy_cfg,
             indicators,
             quantity,
@@ -3355,10 +4674,13 @@ def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
             higher_tf_df=higher_tf_df,
             market=market,
         )
+        dynamic_details = {}
 
     if market == "futures" and signal == "sell" and str(quantity).strip().upper() == "ALL":
         quantity = suggested_buy_quantity(symbol, market, rules, root_cfg, {"symbol": symbol, "market": market})
         reason = f"{reason} Futures routing treats a sell signal as a short entry, so the order size is reset to the configured base quantity."
+
+    indicators.update(dynamic_details or {})
 
     return {
         "ok": True,
@@ -3379,10 +4701,13 @@ def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
             "ma_slow": indicators.get("ma_slow"),
             "ema_fast": indicators.get("ema_fast"),
             "ema_slow": indicators.get("ema_slow"),
+            "atr": indicators.get("atr"),
             "rsi": indicators.get("rsi"),
             "bb_middle": indicators.get("bb_middle"),
             "bb_upper": indicators.get("bb_upper"),
             "bb_lower": indicators.get("bb_lower"),
+            "breakout_level": indicators.get("breakout_level"),
+            "breakdown_level": indicators.get("breakdown_level"),
             "trend_filter_above_ema": indicators.get("trend_filter_above_ema"),
             "trend_filter_ema_value": indicators.get("trend_filter_ema_value"),
             "volume_confirmation": indicators.get("volume_confirmation"),
@@ -3390,6 +4715,9 @@ def action_generate_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
             "current_volume": indicators.get("current_volume"),
             "higher_trend_ok": indicators.get("higher_trend_ok"),
             "higher_tf_ema": indicators.get("higher_tf_ema"),
+            "strategy_votes": indicators.get("strategy_votes"),
+            "vote_totals": indicators.get("vote_totals"),
+            "vote_position_scale": indicators.get("vote_position_scale"),
             "stop_loss": ((load_state(rules).get("open_positions") or {}).get(symbol, {}) or {}).get("stop_loss"),
             "ma_golden_cross": (
                 float(indicators["ma_fast_prev"]) <= float(indicators["ma_slow_prev"])
@@ -3470,7 +4798,14 @@ def action_check_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
             "market_session": session_status,
         }
 
-    if market == "cn_equity" and not session_status.get("execution_allowed", True):
+    execution_cfg = root_execution_config()
+    execution_mode = execution_mode_for_market(market, payload, rules, execution_cfg)
+    if market == "cn_equity" and not session_execution_allowed_for_mode(
+        market,
+        session_status,
+        execution_mode,
+        execution_cfg,
+    ):
         return {
             "ok": True,
             "allowed": False,
@@ -3533,6 +4868,7 @@ def action_check_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
     capital_required = order_value if market != "futures" else (order_value / max(float(leverage), 1.0))
     today = today_key(rules)
     committed_today = float(state.get("daily_risk_committed", {}).get(today, 0.0))
+    daily_notional_today = executed_notional_for_day(rules, market, today)
     futures_trades_today = executed_trade_count_for_day(rules, "futures", today) if market == "futures" else 0
 
     reasons: List[str] = []
@@ -3557,7 +4893,7 @@ def action_check_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("Futures orders require stop_price or estimated_loss to enforce mandatory_stop_loss")
     if market == "futures" and max_position_pct > 0 and capital_required > equity * max_position_pct:
         reasons.append("Futures initial margin exceeds trading.futures.max_position_pct budget")
-    if market != "futures" and max_position_pct > 0 and order_value > equity * max_position_pct:
+    if side == "buy" and market != "futures" and max_position_pct > 0 and order_value > equity * max_position_pct:
         reasons.append("Order value exceeds trading.max_position_pct budget")
     if estimated_loss > equity * float(rules["risk"].get("max_single_loss_pct", 0.02)):
         reasons.append("Estimated single-order loss exceeds max_single_loss_pct budget")
@@ -3567,6 +4903,9 @@ def action_check_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
             if market == "futures"
             else "Daily risk budget would exceed trading.max_daily_loss / max_daily_loss_pct"
         )
+    max_daily_notional = safe_float(rules["risk"].get("max_daily_notional_usdt"))
+    if max_daily_notional is not None and max_daily_notional > 0 and (daily_notional_today + order_value) > float(max_daily_notional):
+        reasons.append("Daily traded notional would exceed max_daily_notional_usdt")
     if side == "buy" and (market_value + order_value) > float(rules["risk"].get("max_position_value_usdt", 100000)):
         reasons.append("Position value would exceed max_position_value_usdt")
     if market == "futures" and futures_cfg.get("max_trades_per_day", 0) > 0 and futures_trades_today >= int(futures_cfg.get("max_trades_per_day", 0)):
@@ -3590,6 +4929,7 @@ def action_check_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
             "capital_required": capital_required,
             "estimated_loss": estimated_loss,
             "committed_daily_risk": committed_today,
+            "daily_notional_today": daily_notional_today,
             "leverage": leverage,
             "futures_trades_today": futures_trades_today,
         },
@@ -3679,8 +5019,6 @@ def action_place_order(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "leverage": payload.get("leverage"),
                 "stop_price": payload.get("stop_price"),
                 "broker_client": execution_cfg.get("easytrader", {}).get("client", ""),
-                "bridge_workspace": execution_cfg.get("ths_bridge", {}).get("workspace", ""),
-                "ths_exe_path": execution_cfg.get("ths_bridge", {}).get("exe_path", ""),
             },
         )
 
@@ -3854,6 +5192,33 @@ def set_combined_strategy_params_override(
     symbol_cfg["rsi_upper"] = float(rsi_upper)
 
 
+def _coerce_strategy_param_value(value: Any) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return float(value)
+    return value
+
+
+def set_symbol_strategy_params_override(
+    rules: Dict[str, Any],
+    symbol: str,
+    strategy_name: str | None,
+    params: Dict[str, Any],
+) -> None:
+    strategy = rules.setdefault("strategy", {})
+    symbol_overrides = strategy.setdefault("symbol_overrides", {})
+    symbol_cfg = symbol_overrides.setdefault(symbol, {})
+    if strategy_name:
+        symbol_cfg["strategy"] = str(strategy_name)
+    for key, value in (params or {}).items():
+        if str(key or "").strip().lower() == "strategy":
+            continue
+        symbol_cfg[str(key)] = _coerce_strategy_param_value(value)
+
+
 def backtest_combined(
     df: pd.DataFrame,
     fast: int,
@@ -3931,6 +5296,187 @@ def backtest_combined(
         "win_rate": win_rate,
         "trade_count": len(trade_returns),
     }
+
+
+def trade_statistics_from_returns(trade_returns: List[float]) -> Dict[str, Any]:
+    returns = [float(item) for item in trade_returns if item is not None]
+    if not returns:
+        return {
+            "total_return": 0.0,
+            "win_rate": 0.0,
+            "trade_count": 0,
+            "avg_win": None,
+            "avg_loss": None,
+            "payoff_ratio": None,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+            "return_drawdown_ratio": 0.0,
+            "score": 0.0,
+            "trade_returns": [],
+        }
+
+    wins = [value for value in returns if value > 0]
+    losses = [abs(value) for value in returns if value < 0]
+    avg_win = float(sum(wins) / len(wins)) if wins else None
+    avg_loss = float(sum(losses) / len(losses)) if losses else None
+    payoff_ratio = float(avg_win / avg_loss) if avg_win is not None and avg_loss not in (None, 0.0) else None
+    non_flat = len(wins) + len(losses)
+    win_rate = float(len(wins) / non_flat) if non_flat else 0.0
+
+    equity = 1.0
+    equity_curve = [equity]
+    for trade_return in returns:
+        equity *= 1.0 + float(trade_return)
+        equity_curve.append(equity)
+
+    running_peak = equity_curve[0]
+    max_drawdown = 0.0
+    for equity_value in equity_curve:
+        running_peak = max(running_peak, equity_value)
+        if running_peak > 0:
+            max_drawdown = min(max_drawdown, (equity_value / running_peak) - 1.0)
+
+    sharpe_ratio = 0.0
+    if len(returns) > 1:
+        series = pd.Series(returns, dtype="float64")
+        std = float(series.std(ddof=1))
+        if std > 0:
+            sharpe_ratio = float(series.mean() / std * math.sqrt(len(returns)))
+
+    total_return = float(equity - 1.0)
+    if max_drawdown < 0:
+        return_drawdown_ratio = float(total_return / abs(max_drawdown))
+    else:
+        return_drawdown_ratio = float(total_return if total_return > 0 else 0.0)
+    score = float(return_drawdown_ratio if return_drawdown_ratio > 0 else max(sharpe_ratio, 0.0))
+    return {
+        "total_return": total_return,
+        "win_rate": win_rate,
+        "trade_count": len(returns),
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "payoff_ratio": payoff_ratio,
+        "sharpe_ratio": sharpe_ratio,
+        "max_drawdown": float(max_drawdown),
+        "return_drawdown_ratio": return_drawdown_ratio,
+        "score": score,
+        "trade_returns": [float(item) for item in returns],
+    }
+
+
+def sanitize_strategy_backtest(result: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(result or {})
+    sanitized.pop("trade_returns", None)
+    return sanitized
+
+
+def backtest_strategy(
+    df: pd.DataFrame,
+    strat_name: str,
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    strategy_cfg = canonicalize_strategy_config(dict(params or {}))
+    strategy_kind = normalize_strategy_kind(strategy_cfg.get("kind") or strat_name)
+    required_rows = strategy_required_lookback(strategy_cfg, 0)
+    if df is None or df.empty or len(df) < required_rows:
+        result = trade_statistics_from_returns([])
+        result.update(
+            {
+                "strategy_name": str(strat_name),
+                "strategy_kind": strategy_kind,
+                "reason": f"insufficient_history:{0 if df is None else len(df)}/{required_rows}",
+            }
+        )
+        return result
+
+    trade_returns: List[float] = []
+    entry_price = None
+    for idx in range(max(required_rows - 1, 1), len(df)):
+        window = df.iloc[: idx + 1]
+        if strategy_kind == "trend_following":
+            signal, _, _ = trend_following_signal(window, strategy_cfg)
+        elif strategy_kind == "mean_reversion":
+            signal, _, _ = mean_reversion_signal(window, strategy_cfg)
+        elif strategy_kind == "breakout":
+            signal, _, _ = breakout_signal(window, strategy_cfg)
+        else:
+            signal = "HOLD"
+
+        close_price = safe_float(window["close"].iloc[-1]) if "close" in window.columns else None
+        if close_price in (None, 0):
+            continue
+        if entry_price is None:
+            if signal == "BUY":
+                entry_price = float(close_price)
+            continue
+        if signal == "SELL":
+            trade_return = (float(close_price) - float(entry_price)) / float(entry_price) if entry_price else 0.0
+            trade_returns.append(trade_return)
+            entry_price = None
+
+    if entry_price is not None:
+        final_price = safe_float(df["close"].iloc[-1]) if "close" in df.columns else None
+        if final_price not in (None, 0):
+            trade_returns.append((float(final_price) - float(entry_price)) / float(entry_price))
+
+    result = trade_statistics_from_returns(trade_returns)
+    recent_20 = trade_statistics_from_returns(trade_returns[-20:])
+    result.update(
+        {
+            "strategy_name": str(strat_name),
+            "strategy_kind": strategy_kind,
+            "recent_20": sanitize_strategy_backtest(recent_20),
+        }
+    )
+    return result
+
+
+def aggregate_strategy_backtests(results_by_symbol: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    for symbol, per_strategy in results_by_symbol.items():
+        for strategy_name, metrics in per_strategy.items():
+            entry = aggregated.setdefault(
+                strategy_name,
+                {
+                    "strategy_name": strategy_name,
+                    "strategy_kind": normalize_strategy_kind((metrics or {}).get("strategy_kind") or strategy_name),
+                    "symbols": {},
+                    "trade_returns": [],
+                },
+            )
+            entry["symbols"][symbol] = sanitize_strategy_backtest(metrics)
+            entry["trade_returns"].extend((metrics or {}).get("trade_returns") or [])
+
+    final_payload: Dict[str, Dict[str, Any]] = {}
+    for strategy_name, metrics in aggregated.items():
+        returns = metrics.pop("trade_returns", [])
+        summary = trade_statistics_from_returns(returns)
+        summary["strategy_name"] = strategy_name
+        summary["strategy_kind"] = metrics.get("strategy_kind")
+        summary["symbol_count"] = len(metrics.get("symbols") or {})
+        summary["recent_20"] = sanitize_strategy_backtest(trade_statistics_from_returns(returns[-20:]))
+        summary["symbols"] = metrics.get("symbols") or {}
+        final_payload[strategy_name] = sanitize_strategy_backtest(summary)
+    return final_payload
+
+
+def update_strategy_performance_state(
+    rules: Dict[str, Any],
+    strategy_performance: Dict[str, Dict[str, Any]],
+    strategy_weights: Dict[str, float],
+) -> None:
+    snapshot = {
+        name: {
+            **sanitize_strategy_backtest(metrics),
+            "weight": float(strategy_weights.get(name, 0.0) or 0.0),
+            "updated_at": now_local(rules).isoformat(),
+        }
+        for name, metrics in (strategy_performance or {}).items()
+    }
+    with runtime_lock(rules):
+        state = load_state(rules)
+        state["strategy_performance"] = snapshot
+        save_state(state, rules)
 
 
 def summarize_symbol_performance(
@@ -4025,6 +5571,56 @@ def actionable_timestamps_for_symbol(symbol: str, events: List[Dict[str, Any]], 
     return timestamps
 
 
+def recent_error_reasons_for_symbol(
+    symbol: str,
+    events: List[Dict[str, Any]],
+    rules: Dict[str, Any],
+    *,
+    now_ts: datetime | None = None,
+    lookback_hours: int = 48,
+) -> List[str]:
+    current_time = now_ts or now_local(rules)
+    cutoff = current_time - timedelta(hours=max(int(lookback_hours), 1))
+    reasons: List[str] = []
+    for event in events:
+        if str(event.get("symbol") or "").strip() != symbol:
+            continue
+        if str(event.get("status") or "").strip().lower() != "error":
+            continue
+        event_time = parse_event_timestamp(event.get("timestamp"), rules)
+        if event_time is not None and event_time < cutoff:
+            continue
+        details = event.get("details") or {}
+        reason = str(
+            details.get("reason")
+            or details.get("error")
+            or event.get("message")
+            or ""
+        ).strip()
+        if reason:
+            reasons.append(reason)
+    return reasons
+
+
+def is_bad_symbol_error(reason: str) -> bool:
+    text = str(reason or "").strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "badsymbol",
+            "market symbol",
+            "symbol is invalid",
+            "does not have market symbol",
+            "not found",
+        )
+    )
+
+
+def is_market_data_auth_failure(reason: str) -> bool:
+    text = str(reason or "").strip().lower()
+    return "authenticationerror" in text and "api key" in text
+
+
 def business_days_between(start: datetime, end: datetime) -> int:
     if end <= start:
         return 0
@@ -4083,6 +5679,24 @@ def cleanup_dynamic_assets(
         if cumulative_ratio is not None and cumulative_ratio <= -abs(drawdown_limit):
             reasons.append(f"cumulative pnl ratio {cumulative_ratio:.4f} breached -{abs(drawdown_limit):.4f}")
 
+        recent_error_reasons = recent_error_reasons_for_symbol(
+            symbol_text,
+            symbol_events,
+            rules,
+            now_ts=current_time,
+            lookback_hours=int(market_cfg.get("error_lookback_hours", 48) or 48),
+        )
+        bad_symbol_errors = [reason for reason in recent_error_reasons if is_bad_symbol_error(reason)]
+        auth_failures = [reason for reason in recent_error_reasons if is_market_data_auth_failure(reason)]
+        max_market_data_errors = max(int(market_cfg.get("remove_after_error_count", 2) or 2), 1)
+        if bad_symbol_errors:
+            reasons.append("recent market-data failures indicate the symbol is invalid or no longer tradable")
+        elif len(auth_failures) >= max_market_data_errors:
+            reasons.append(
+                f"recent market-data authentication failures reached {len(auth_failures)} in the last "
+                f"{int(market_cfg.get('error_lookback_hours', 48) or 48)}h"
+            )
+
         if not reasons:
             continue
 
@@ -4132,10 +5746,7 @@ def discover_crypto_candidates(rules: Dict[str, Any], root_cfg: Dict[str, Any], 
         }
     )
     if bool((rules.get("account", {}) or {}).get("testnet", True)):
-        try:
-            exchange.set_sandbox_mode(True)
-        except Exception:
-            pass  # sandbox mode may not be supported for all market types
+        exchange.set_sandbox_mode(True)
 
     min_volume = float(cfg.get("min_volume_usdt", 1000) or 1000)
     min_price = float(cfg.get("min_price", 0.01) or 0.01)
@@ -4351,14 +5962,17 @@ def action_discover_assets(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "enabled": False, "message": "auto_discover disabled", "action": "discover_assets"}
 
     now_ts = now_local(rules)
+    requested_markets = requested_markets_from_payload(payload, ["crypto", "cn_equity"])
+    macro_state = load_macro_state(rules, root_cfg)
     existing_symbols = set(str(symbol) for symbol in rules.get("agent", {}).get("symbols", []))
     removed = cleanup_dynamic_assets(rules, root_cfg=root_cfg, events=load_decision_events(rules), now_ts=now_ts) if cfg.get("cleanup_on_discovery", True) else []
     added_crypto: List[str] = []
     added_cn: List[str] = []
     errors: List[Dict[str, str]] = []
+    skipped_markets: List[Dict[str, Any]] = []
 
     crypto_cfg = cfg.get("crypto", {}) or {}
-    if crypto_cfg.get("enabled", True):
+    if "crypto" in requested_markets and crypto_cfg.get("enabled", True):
         try:
             crypto_candidates = [candidate for candidate in discover_crypto_candidates(rules, root_cfg, crypto_cfg) if candidate.get("symbol") not in existing_symbols]
             added_crypto = add_symbols_to_rules(rules, crypto_candidates, market="crypto", market_cfg=crypto_cfg, discovered_at=now_ts)
@@ -4367,13 +5981,31 @@ def action_discover_assets(payload: Dict[str, Any]) -> Dict[str, Any]:
             errors.append({"market": "crypto", "error": f"{type(exc).__name__}: {exc}"})
 
     cn_cfg = cfg.get("cn_equity", {}) or {}
-    if cn_cfg.get("enabled", True):
-        try:
-            cn_candidates = [candidate for candidate in discover_cn_equity_candidates(cn_cfg) if candidate.get("symbol") not in existing_symbols]
-            added_cn = add_symbols_to_rules(rules, cn_candidates, market="cn_equity", market_cfg=cn_cfg, discovered_at=now_ts)
-            existing_symbols.update(added_cn)
-        except Exception as exc:
-            errors.append({"market": "cn_equity", "error": f"{type(exc).__name__}: {exc}"})
+    if "cn_equity" in requested_markets and cn_cfg.get("enabled", True):
+        cn_macro = (macro_state.get("markets") or {}).get("cn_equity") or {}
+        cn_vol_percentile = safe_float(cn_macro.get("volatility_percentile"))
+        max_cn_volatility_percentile = safe_float(cn_cfg.get("max_volatility_percentile"))
+        if max_cn_volatility_percentile is None:
+            max_cn_volatility_percentile = safe_float((root_cfg.get("trading", {}) or {}).get("macro", {}).get("high_vol_percentile"))
+        if max_cn_volatility_percentile is None:
+            max_cn_volatility_percentile = 0.8
+        if cn_vol_percentile is not None and cn_vol_percentile >= float(max_cn_volatility_percentile):
+            skipped_markets.append(
+                {
+                    "market": "cn_equity",
+                    "reason": (
+                        f"cn_equity volatility_percentile {cn_vol_percentile:.2f} exceeds discovery ceiling "
+                        f"{float(max_cn_volatility_percentile):.2f}"
+                    ),
+                }
+            )
+        else:
+            try:
+                cn_candidates = [candidate for candidate in discover_cn_equity_candidates(cn_cfg) if candidate.get("symbol") not in existing_symbols]
+                added_cn = add_symbols_to_rules(rules, cn_candidates, market="cn_equity", market_cfg=cn_cfg, discovered_at=now_ts)
+                existing_symbols.update(added_cn)
+            except Exception as exc:
+                errors.append({"market": "cn_equity", "error": f"{type(exc).__name__}: {exc}"})
 
     trimmed = trim_excess_symbols(rules, int(cfg.get("max_total_symbols", 15) or 15))
     if trimmed:
@@ -4393,21 +6025,623 @@ def action_discover_assets(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ok": True,
         "enabled": True,
         "dry_run": dry_run,
+        "requested_markets": requested_markets,
         "added_crypto": added_crypto,
         "added_cn": added_cn,
         "removed": removed,
         "errors": errors,
+        "skipped_markets": skipped_markets,
         "partial_failure": bool(errors),
         "total_symbols": len(rules.get("agent", {}).get("symbols", [])),
         "auto_discover": auto_discover_summary(rules, root_cfg),
     }
 
 
+def _write_json_payload(path: Path, payload: Dict[str, Any]) -> None:
+    ensure_parent(path)
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _gm_strategy_python_executable(payload: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    candidate = (
+        str(payload.get("python_executable") or "")
+        or str(payload.get("gm_python_executable") or "")
+        or str(cfg.get("python_executable") or "")
+        or str(os.getenv("OPENCLAW_GM_PYTHON") or "")
+        or sys.executable
+    )
+    return str(candidate).strip() or sys.executable
+
+
+def _gm_strategy_token_details(payload: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, str]:
+    token_env = str(payload.get("token_env") or cfg.get("token_env") or "GM_TOKEN").strip() or "GM_TOKEN"
+    token = str(payload.get("token") or cfg.get("token") or os.getenv(token_env) or os.getenv("GM_TOKEN") or "").strip()
+    return token_env, token
+
+
+def _gm_strategy_resolved_params(payload: Dict[str, Any], cfg: Dict[str, Any], *, base_key: str = "base_params") -> Dict[str, Any]:
+    params = dict(cfg.get(base_key, {}) or {})
+    payload_base_params = payload.get(base_key, {}) or {}
+    if isinstance(payload_base_params, dict):
+        params.update(payload_base_params)
+    payload_params = payload.get("params", {}) or {}
+    if isinstance(payload_params, dict):
+        params.update(payload_params)
+
+    account_id = (
+        payload.get("account_id")
+        or params.get("account_id")
+        or cfg.get("account_id")
+        or os.getenv("GM_ACCOUNT_ID")
+        or os.getenv("GM_ACCOUNT")
+        or ""
+    )
+    params["account_id"] = str(account_id or "").strip()
+    return params
+
+
+def _gm_strategy_backtest_settings(payload: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    base = dict(cfg.get("backtest", {}) or {})
+    override = payload.get("backtest", {}) or {}
+    if isinstance(override, dict):
+        base = deep_merge(base, override)
+
+    legacy_mapping = {
+        "backtest_start_time": "start_time",
+        "backtest_end_time": "end_time",
+        "backtest_initial_cash": "initial_cash",
+        "backtest_transaction_ratio": "transaction_ratio",
+        "backtest_commission_ratio": "commission_ratio",
+        "backtest_slippage_ratio": "slippage_ratio",
+        "backtest_adjust": "adjust",
+        "backtest_check_cache": "check_cache",
+        "backtest_match_mode": "match_mode",
+        "backtest_intraday": "intraday",
+    }
+    for source_key, target_key in legacy_mapping.items():
+        if payload.get(source_key) not in (None, ""):
+            base[target_key] = payload.get(source_key)
+    return base
+
+
+def _gm_strategy_metric_value(metrics: Dict[str, Any] | None, key: str) -> float | None:
+    if not metrics or not key:
+        return None
+    current: Any = metrics
+    for part in str(key).split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current.get(part)
+    if current in (None, ""):
+        return None
+    try:
+        return float(current)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gm_strategy_candidate_score(result: Dict[str, Any], maximize_metric: str, minimize_metric: str | None) -> tuple[float, float, float]:
+    metrics = result.get("metrics") or {}
+    primary = _gm_strategy_metric_value(metrics, maximize_metric)
+    minimize_value = _gm_strategy_metric_value(metrics, minimize_metric) if minimize_metric else None
+    trade_count = (
+        _gm_strategy_metric_value(metrics, "trade_count")
+        or _gm_strategy_metric_value(metrics, "total_count")
+        or 0.0
+    )
+    primary_score = primary if primary is not None else float("-inf")
+    secondary_score = -abs(minimize_value) if minimize_value is not None else 0.0
+    return (primary_score, secondary_score, trade_count)
+
+
+def _gm_strategy_params_match(full_params: Dict[str, Any], expected_subset: Dict[str, Any]) -> bool:
+    for key, value in (expected_subset or {}).items():
+        if full_params.get(key) != value:
+            return False
+    return True
+
+
+def _gm_event_payloads(text: str, event_name: str) -> List[Dict[str, Any]]:
+    prefix = f"{str(event_name or '').strip()}="
+    payloads: List[Dict[str, Any]] = []
+    if not prefix.strip("="):
+        return payloads
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith(prefix):
+            continue
+        try:
+            parsed = json.loads(line[len(prefix):].strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payloads.append(parsed)
+        else:
+            payloads.append({"value": parsed})
+    return payloads
+
+
+def normalize_gm_symbol(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return text
+    if text.startswith(("SHSE.", "SZSE.", "BJSE.")):
+        return text
+    code = extract_cn_equity_code(text) or text
+    if code[:1] in {"5", "6", "9"}:
+        return f"SHSE.{code}"
+    if code[:1] in {"4", "8"}:
+        return f"BJSE.{code}"
+    return f"SZSE.{code}"
+
+
+def _gm_probe_rows(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return list(value.get("data") or value.get("orders") or value.get("positions") or [value])
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _gm_probe_balance_payload(cash_snapshot: Any) -> Dict[str, float]:
+    rows = _gm_probe_rows(cash_snapshot)
+    cash = rows[0] if rows else cash_snapshot
+    if not isinstance(cash, dict):
+        cash = {}
+    total_asset = float(safe_float(cash.get("nav")) or 0.0)
+    available = float(safe_float(cash.get("available")) or 0.0)
+    pnl = float(safe_float(cash.get("pnl")) or 0.0)
+    order_frozen = float(safe_float(cash.get("order_frozen")) or 0.0)
+    return {
+        "total_asset": total_asset,
+        "cash": available,
+        "market_value": max(total_asset - available - order_frozen, 0.0),
+        "pnl": pnl,
+    }
+
+
+def _gm_probe_positions_payload(position_snapshot: Any) -> List[Dict[str, Any]]:
+    positions: List[Dict[str, Any]] = []
+    for row in _gm_probe_rows(position_snapshot):
+        if not isinstance(row, dict):
+            continue
+        quantity = float(safe_float(row.get("volume")) or 0.0)
+        if quantity <= 0:
+            continue
+        positions.append(
+            {
+                "symbol": str(row.get("symbol") or ""),
+                "quantity": quantity,
+                "avg_price": float(safe_float(row.get("vwap")) or 0.0),
+                "current_price": float(safe_float(row.get("price")) or 0.0),
+                "unrealized_pnl": float(safe_float(row.get("fpnl")) or 0.0),
+                "realized_pnl": float(safe_float(row.get("pnl")) or 0.0),
+                "available_now": float(safe_float(row.get("available_now")) or 0.0),
+            }
+        )
+    return positions
+
+
+def action_probe_gm_account(payload: Dict[str, Any]) -> Dict[str, Any]:
+    rules = load_rules(payload)
+    root_cfg = load_root_config()
+    cfg = gm_strategy_config(rules, root_cfg)
+    probe_cfg = cfg.get("account_probe", {}) or {}
+    template_path = resolve_workspace_path(
+        payload.get("template_file") or probe_cfg.get("template_file"),
+        gm_account_probe_template_path(rules, root_cfg),
+    )
+    runtime_dir = gm_strategy_runtime_dir(rules, root_cfg)
+    python_executable = _gm_strategy_python_executable(payload, cfg)
+    token_env, token = _gm_strategy_token_details(payload, cfg)
+    params = _gm_strategy_resolved_params(payload, cfg)
+    symbol = str(payload.get("symbol") or params.get("symbol") or "").strip()
+    if symbol:
+        params["symbol"] = normalize_gm_symbol(symbol)
+    params["poll_attempts"] = int(payload.get("poll_attempts") or probe_cfg.get("poll_attempts") or 3)
+    params["poll_interval_sec"] = float(
+        payload.get("poll_interval_sec") or probe_cfg.get("poll_interval_sec") or 1.5
+    )
+    timeout_sec = int(payload.get("timeout_sec") or probe_cfg.get("timeout_sec") or 45)
+    strategy_id = str(payload.get("strategy_id") or probe_cfg.get("strategy_id") or "openclaw_gm_account_probe").strip()
+
+    account_id = str(params.get("account_id") or "").strip()
+    if not token:
+        return {"ok": False, "connected": False, "error": f"Missing gm token in env {token_env}", "token_env": token_env}
+    if not account_id:
+        return {"ok": False, "connected": False, "error": "Missing gm account_id"}
+    if not template_path.exists():
+        return {"ok": False, "connected": False, "error": f"Template not found: {template_path}"}
+
+    try:
+        report = gm_run_live_once(
+            template_path=template_path,
+            params=params,
+            runtime_dir=runtime_dir,
+            python_executable=python_executable,
+            token=token,
+            token_env_name=token_env,
+            strategy_id=strategy_id,
+            timeout_sec=timeout_sec,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "connected": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "account_id": account_id,
+            "symbol": params.get("symbol") or "",
+        }
+
+    stdout = str(report.get("stdout") or "")
+    stderr = str(report.get("stderr") or "")
+    probe_payloads = _gm_event_payloads(stdout, "OPENCLAW_ACCOUNT_PROBE")
+    trade_connected_events = _gm_event_payloads(stdout, "OPENCLAW_ACCOUNT_PROBE_TRADE_CONNECTED")
+    account_status_events = _gm_event_payloads(stdout, "OPENCLAW_ACCOUNT_PROBE_ACCOUNT_STATUS")
+    error_events = _gm_event_payloads(stdout, "OPENCLAW_ACCOUNT_PROBE_ERROR")
+    exception_events = _gm_event_payloads(stdout, "OPENCLAW_RUN_EXCEPTION")
+    latest_probe = probe_payloads[-1] if probe_payloads else {}
+    balance = _gm_probe_balance_payload(latest_probe.get("cash"))
+    positions = _gm_probe_positions_payload(latest_probe.get("positions"))
+
+    connected = bool(
+        probe_payloads
+        or trade_connected_events
+        or account_status_events
+        or latest_probe.get("context_account_exists")
+        or balance.get("total_asset")
+        or positions
+    )
+    error_parts: List[str] = []
+    for item in error_events + exception_events:
+        for key in ("info", "error", "traceback", "message"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                error_parts.append(value)
+                break
+    if not error_parts:
+        for key, value in latest_probe.items():
+            if key.endswith("_error") and str(value or "").strip():
+                error_parts.append(str(value).strip())
+    if not error_parts and stderr.strip():
+        error_parts.append(stderr.strip().splitlines()[-1])
+
+    return {
+        "ok": bool(report.get("ok")) or connected,
+        "connected": connected,
+        "error": "; ".join(error_parts),
+        "account_id": account_id,
+        "symbol": str(params.get("symbol") or ""),
+        "balance": balance,
+        "positions": positions,
+        "report_path": report.get("report_path"),
+        "stdout_path": report.get("stdout_path"),
+        "stderr_path": report.get("stderr_path"),
+        "returncode": report.get("returncode"),
+        "timed_out": report.get("timed_out"),
+        "raw_probe": latest_probe,
+    }
+
+
+def _gm_strategy_param_combinations(param_grid: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not param_grid:
+        return []
+    keys = [str(key) for key in param_grid.keys()]
+    value_sets: List[List[Any]] = []
+    for key in keys:
+        raw_values = param_grid.get(key)
+        if isinstance(raw_values, list):
+            values = raw_values
+        else:
+            values = [raw_values]
+        value_sets.append(list(values))
+
+    combinations: List[Dict[str, Any]] = []
+    for combo in itertools.product(*value_sets):
+        candidate = dict(zip(keys, combo))
+        fast_value = candidate.get("fast", candidate.get("fast_period"))
+        slow_value = candidate.get("slow", candidate.get("slow_period"))
+        if fast_value is not None and slow_value is not None:
+            try:
+                if float(slow_value) <= float(fast_value):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        combinations.append(candidate)
+    return combinations
+
+
+def action_backtest_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    rules = load_rules(payload)
+    root_cfg = load_root_config()
+    cfg = gm_strategy_config(rules, root_cfg)
+    template_path = resolve_workspace_path(payload.get("template_file") or cfg.get("template_file"), gm_strategy_template_path(rules, root_cfg))
+    runtime_dir = gm_strategy_runtime_dir(rules, root_cfg)
+    python_executable = _gm_strategy_python_executable(payload, cfg)
+    token_env, token = _gm_strategy_token_details(payload, cfg)
+    strategy_id = str(payload.get("strategy_id") or cfg.get("strategy_id") or f"openclaw_{template_path.stem}").strip()
+    params = _gm_strategy_resolved_params(payload, cfg)
+    backtest_cfg = _gm_strategy_backtest_settings(payload, cfg)
+    timeout_sec = int(payload.get("timeout_sec") or backtest_cfg.get("timeout_sec") or 300)
+
+    if not token:
+        return {"ok": False, "mode": "backtest", "error": f"Missing gm token in env {token_env}", "token_env": token_env}
+    if not template_path.exists():
+        return {"ok": False, "mode": "backtest", "error": f"Template not found: {template_path}", "template_path": str(template_path)}
+
+    try:
+        return gm_run_backtest(
+            template_path=template_path,
+            params=params,
+            runtime_dir=runtime_dir,
+            python_executable=python_executable,
+            token=token,
+            token_env_name=token_env,
+            strategy_id=strategy_id,
+            backtest=backtest_cfg,
+            timeout_sec=timeout_sec,
+        )
+    except (GmStrategyRuntimeError, FileNotFoundError, subprocess.SubprocessError) as exc:
+        return {
+            "ok": False,
+            "mode": "backtest",
+            "error": str(exc),
+            "template_path": str(template_path),
+            "python_executable": python_executable,
+        }
+
+
+def action_get_strategy_simulation_status(payload: Dict[str, Any]) -> Dict[str, Any]:
+    rules = load_rules(payload)
+    root_cfg = load_root_config()
+    cfg = gm_strategy_config(rules, root_cfg)
+    simulation_cfg = cfg.get("simulation", {}) or {}
+    state_path = resolve_workspace_path(payload.get("state_file") or simulation_cfg.get("state_file"), gm_strategy_simulation_state_path(rules, root_cfg))
+    if not state_path.exists():
+        return {"ok": True, "configured": False, "running": False, "state_path": str(state_path)}
+    state = gm_read_simulation_state(state_path)
+    state["ok"] = True
+    state["configured"] = True
+    return state
+
+
+def action_stop_strategy_simulation(payload: Dict[str, Any]) -> Dict[str, Any]:
+    rules = load_rules(payload)
+    root_cfg = load_root_config()
+    cfg = gm_strategy_config(rules, root_cfg)
+    simulation_cfg = cfg.get("simulation", {}) or {}
+    state_path = resolve_workspace_path(payload.get("state_file") or simulation_cfg.get("state_file"), gm_strategy_simulation_state_path(rules, root_cfg))
+    if not state_path.exists():
+        return {"ok": True, "configured": False, "running": False, "state_path": str(state_path)}
+
+    state = gm_read_simulation_state(state_path)
+    pid = int(state.get("pid") or 0)
+    stop_result = gm_stop_simulation_process(pid, force=bool(payload.get("force", False)))
+    updated_state = dict(state)
+    updated_state["running"] = False
+    updated_state["stopped_at"] = now_local(rules).isoformat()
+    updated_state["last_stop_result"] = stop_result
+    _write_json_payload(state_path, updated_state)
+    return {
+        "ok": bool(stop_result.get("ok", False)),
+        "state_path": str(state_path),
+        "running": False,
+        "stop_result": stop_result,
+        "state": updated_state,
+    }
+
+
+def action_start_strategy_simulation(payload: Dict[str, Any]) -> Dict[str, Any]:
+    rules = load_rules(payload)
+    root_cfg = load_root_config()
+    cfg = gm_strategy_config(rules, root_cfg)
+    simulation_cfg = cfg.get("simulation", {}) or {}
+    template_path = resolve_workspace_path(payload.get("template_file") or cfg.get("template_file"), gm_strategy_template_path(rules, root_cfg))
+    state_path = resolve_workspace_path(payload.get("state_file") or simulation_cfg.get("state_file"), gm_strategy_simulation_state_path(rules, root_cfg))
+    runtime_dir = gm_strategy_runtime_dir(rules, root_cfg)
+    python_executable = _gm_strategy_python_executable(payload, cfg)
+    token_env, token = _gm_strategy_token_details(payload, cfg)
+    strategy_id = str(payload.get("strategy_id") or cfg.get("strategy_id") or f"openclaw_{template_path.stem}").strip()
+    replace_existing = bool(payload.get("replace_existing", simulation_cfg.get("replace_existing", True)))
+    params = _gm_strategy_resolved_params(payload, cfg)
+
+    if not token:
+        return {"ok": False, "mode": "simulation", "error": f"Missing gm token in env {token_env}", "token_env": token_env}
+    if not template_path.exists():
+        return {"ok": False, "mode": "simulation", "error": f"Template not found: {template_path}", "template_path": str(template_path)}
+
+    try:
+        return gm_start_simulation(
+            template_path=template_path,
+            params=params,
+            runtime_dir=runtime_dir,
+            python_executable=python_executable,
+            token=token,
+            state_path=state_path,
+            token_env_name=token_env,
+            strategy_id=strategy_id,
+            replace_existing=replace_existing,
+        )
+    except (GmStrategyRuntimeError, FileNotFoundError, subprocess.SubprocessError) as exc:
+        return {
+            "ok": False,
+            "mode": "simulation",
+            "error": str(exc),
+            "template_path": str(template_path),
+            "python_executable": python_executable,
+        }
+
+
+def action_optimize_gm_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    rules = load_rules(payload)
+    root_cfg = load_root_config()
+    cfg = gm_strategy_config(rules, root_cfg)
+    optimization_cfg = cfg.get("optimization", {}) or {}
+    template_path = resolve_workspace_path(payload.get("template_file") or cfg.get("template_file"), gm_strategy_template_path(rules, root_cfg))
+    runtime_dir = gm_strategy_runtime_dir(rules, root_cfg)
+    python_executable = _gm_strategy_python_executable(payload, cfg)
+    token_env, token = _gm_strategy_token_details(payload, cfg)
+    strategy_id = str(payload.get("strategy_id") or cfg.get("strategy_id") or f"openclaw_{template_path.stem}").strip()
+    param_grid = dict(optimization_cfg.get("param_grid", {}) or {})
+    param_grid.update(payload.get("param_grid", {}) or {})
+    combinations = _gm_strategy_param_combinations(param_grid)
+    base_params = _gm_strategy_resolved_params(payload, cfg)
+    backtest_cfg = _gm_strategy_backtest_settings(payload, cfg)
+    timeout_sec = int(payload.get("timeout_sec") or backtest_cfg.get("timeout_sec") or 300)
+    maximize_metric = str(payload.get("maximize_metric") or optimization_cfg.get("maximize_metric") or "pnl_ratio").strip()
+    minimize_metric = str(payload.get("minimize_metric") or optimization_cfg.get("minimize_metric") or "max_drawdown").strip()
+    min_trade_count = int(payload.get("min_trade_count") or optimization_cfg.get("min_trade_count") or 0)
+    min_improvement = float(payload.get("min_improvement") or optimization_cfg.get("min_improvement") or 0.0)
+    persist_best_params = bool(payload.get("persist_best_params", optimization_cfg.get("persist_best_params", False)))
+    restart_simulation = bool(payload.get("restart_simulation", optimization_cfg.get("restart_simulation", False)))
+    symbol = str(payload.get("symbol") or "").strip()
+    strategy_name = str(payload.get("strategy_name") or optimization_cfg.get("strategy_name") or "").strip() or None
+
+    if not token:
+        return {"ok": False, "mode": "gm_strategy_optimization", "error": f"Missing gm token in env {token_env}", "token_env": token_env}
+    if not template_path.exists():
+        return {"ok": False, "mode": "gm_strategy_optimization", "error": f"Template not found: {template_path}", "template_path": str(template_path)}
+    if not combinations:
+        return {"ok": False, "mode": "gm_strategy_optimization", "error": "No valid parameter combinations provided", "param_grid": param_grid}
+
+    results: List[Dict[str, Any]] = []
+    for combo in combinations:
+        run_params = dict(base_params)
+        run_params.update(combo)
+        result = gm_run_backtest(
+            template_path=template_path,
+            params=run_params,
+            runtime_dir=runtime_dir,
+            python_executable=python_executable,
+            token=token,
+            token_env_name=token_env,
+            strategy_id=strategy_id,
+            backtest=backtest_cfg,
+            timeout_sec=timeout_sec,
+        )
+        score = _gm_strategy_candidate_score(result, maximize_metric, minimize_metric or None)
+        trade_count = _gm_strategy_metric_value(result.get("metrics") or {}, "trade_count") or 0.0
+        result["score"] = list(score)
+        result["eligible"] = bool(result.get("ok")) and trade_count >= min_trade_count
+        results.append(result)
+
+    current_params = dict(payload.get("current_params", {}) or {})
+    if not current_params:
+        inferred = {key: base_params[key] for key in param_grid.keys() if key in base_params}
+        if len(inferred) == len(param_grid):
+            current_params = inferred
+
+    current_result = None
+    if current_params:
+        for result in results:
+            if _gm_strategy_params_match(result.get("params", {}), current_params):
+                current_result = result
+                break
+        if current_result is None:
+            baseline_params = dict(base_params)
+            baseline_params.update(current_params)
+            current_result = gm_run_backtest(
+                template_path=template_path,
+                params=baseline_params,
+                runtime_dir=runtime_dir,
+                python_executable=python_executable,
+                token=token,
+                token_env_name=token_env,
+                strategy_id=strategy_id,
+                backtest=backtest_cfg,
+                timeout_sec=timeout_sec,
+            )
+            current_result["score"] = list(_gm_strategy_candidate_score(current_result, maximize_metric, minimize_metric or None))
+            current_result["eligible"] = bool(current_result.get("ok"))
+            current_result["is_current"] = True
+            results.append(current_result)
+
+    eligible_results = [result for result in results if result.get("eligible")]
+    best_result = max(eligible_results, key=lambda item: tuple(item.get("score") or [])) if eligible_results else None
+
+    improvement = None
+    changed = bool(best_result)
+    if best_result is not None and current_result is not None:
+        best_metric = _gm_strategy_metric_value(best_result.get("metrics") or {}, maximize_metric)
+        current_metric = _gm_strategy_metric_value(current_result.get("metrics") or {}, maximize_metric)
+        if best_metric is not None and current_metric is not None:
+            improvement = best_metric - current_metric
+            changed = best_result.get("params") != current_result.get("params") and improvement > min_improvement
+        else:
+            changed = best_result.get("params") != current_result.get("params")
+
+    rules_path_saved = None
+    if persist_best_params and changed and best_result and symbol:
+        set_symbol_strategy_params_override(
+            rules,
+            symbol,
+            strategy_name,
+            {key: best_result.get("params", {}).get(key) for key in param_grid.keys()},
+        )
+        rules_path = get_rules_path(payload)
+        save_rules(rules, rules_path)
+        rules_path_saved = str(rules_path)
+
+    simulation_result = None
+    if restart_simulation and changed and best_result:
+        simulation_payload = dict(payload)
+        simulation_payload["params"] = best_result.get("params", {})
+        simulation_payload["replace_existing"] = True
+        simulation_result = action_start_strategy_simulation(simulation_payload)
+
+    report_path = resolve_workspace_path(payload.get("report_file"), gm_strategy_optimization_report_path(rules, root_cfg))
+    report_payload = {
+        "generated_at": now_local(rules).isoformat(),
+        "ok": best_result is not None,
+        "mode": "gm_strategy_optimization",
+        "strategy_id": strategy_id,
+        "template_path": str(template_path),
+        "maximize_metric": maximize_metric,
+        "minimize_metric": minimize_metric or None,
+        "min_trade_count": min_trade_count,
+        "min_improvement": min_improvement,
+        "base_params": base_params,
+        "current_params": current_params or None,
+        "current_result": current_result,
+        "best_result": best_result,
+        "changed": changed,
+        "improvement": improvement,
+        "persisted_rules_path": rules_path_saved,
+        "simulation_result": simulation_result,
+        "results": results,
+    }
+    _write_json_payload(report_path, report_payload)
+
+    return {
+        "ok": best_result is not None,
+        "mode": "gm_strategy_optimization",
+        "strategy_id": strategy_id,
+        "best_result": best_result,
+        "current_result": current_result,
+        "changed": changed,
+        "improvement": improvement,
+        "persisted_rules_path": rules_path_saved,
+        "simulation_result": simulation_result,
+        "report_path": str(report_path),
+        "result_count": len(results),
+    }
+
+
 def action_optimize_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    optimizer_mode = str(payload.get("optimizer_mode") or "").strip().lower()
+    if optimizer_mode in {"gm", "gm_strategy"} or (payload.get("template_file") and payload.get("param_grid")):
+        return action_optimize_gm_strategy(payload)
+
     rules = load_rules(payload)
     root_cfg = load_root_config()
     cfg = optimization_config(rules, root_cfg)
     dry_run = bool(payload.get("dry_run", False))
+    requested_markets = requested_markets_from_payload(payload, review_markets_from_rules(rules))
     lookback_events = int(payload.get("lookback_events") or cfg.get("lookback_events", 200))
     lookback_days = int(payload.get("lookback_days") or cfg.get("lookback_days", 30))
 
@@ -4454,6 +6688,11 @@ def action_optimize_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
             },
         }
     )
+    symbols = [
+        symbol
+        for symbol in symbols
+        if infer_market({"symbol": symbol}, rules, symbol) in requested_markets
+    ]
 
     min_executed = int(cfg.get("min_executed_trades", 3))
     min_pnl_samples = int(cfg.get("min_pnl_samples", 3))
@@ -4613,9 +6852,111 @@ def action_optimize_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not dry_run:
             set_order_size_override(rules, symbol, market, proposed_size)
 
+    strategy_registry = strategy_registry_from_rules(rules)
+    strategy_defs = {
+        name: definition
+        for name, definition in strategy_registry.items()
+        if normalize_strategy_kind(definition.get("kind") or name) in {"trend_following", "mean_reversion", "breakout"}
+    }
+    current_strategy_weights = dynamic_strategy_weights_from_rules(rules)
+    strategy_history_lookback = max(
+        int(payload.get("strategy_backtest_lookback") or cfg.get("strategy_backtest_lookback", 260) or 260),
+        max((strategy_required_lookback(definition, 0, rules) for definition in strategy_defs.values()), default=60),
+    )
+    cn_equity_symbols: List[str] = []
+    if "cn_equity" in requested_markets:
+        cn_equity_symbols = sorted(
+            {
+                str(symbol or "").strip()
+                for symbol in (
+                    list(symbol_groups_from_rules(rules).get("cn_equity", []) or [])
+                    + list(rules.get("agent", {}).get("core_symbols", []) or [])
+                    + list((rules.get("strategy", {}).get("symbol_overrides", {}) or {}).keys())
+                )
+                if str(symbol or "").strip()
+                and infer_market({"symbol": str(symbol)}, rules, str(symbol)) == "cn_equity"
+            }
+        )
+    strategy_backtests_by_symbol: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for symbol in cn_equity_symbols:
+        settings = market_settings_for_symbol(symbol, rules, {"symbol": symbol, "market": "cn_equity"})
+        interval = str(settings.get("timeframe") or "1d")
+        try:
+            history_df, _ = fetch_market_dataframe(
+                {"symbol": symbol, "market": "cn_equity"},
+                rules,
+                symbol,
+                interval,
+                strategy_history_lookback,
+            )
+        except Exception:
+            history_df = None
+        if history_df is None or history_df.empty:
+            continue
+        symbol_results: Dict[str, Dict[str, Any]] = {}
+        for strategy_name, definition in strategy_defs.items():
+            symbol_results[strategy_name] = backtest_strategy(history_df, strategy_name, definition)
+        if symbol_results:
+            strategy_backtests_by_symbol[symbol] = symbol_results
+
+    strategy_performance = aggregate_strategy_backtests(strategy_backtests_by_symbol)
+    optimized_strategy_weights = dict(current_strategy_weights)
+    if strategy_performance:
+        raw_scores: Dict[str, float] = {}
+        active_names = sorted({*current_strategy_weights.keys(), *strategy_performance.keys()})
+        for strategy_name in active_names:
+            metrics = strategy_performance.get(strategy_name, {})
+            score = safe_float(metrics.get("return_drawdown_ratio"))
+            if score is None or not math.isfinite(score) or score <= 0:
+                sharpe_score = safe_float(metrics.get("sharpe_ratio"))
+                if sharpe_score is None or not math.isfinite(sharpe_score):
+                    sharpe_score = 0.0
+                score = max(float(sharpe_score), 0.0)
+            if int(metrics.get("trade_count") or 0) <= 0 or not math.isfinite(float(score)):
+                score = 0.0
+            raw_scores[strategy_name] = max(score, 0.0)
+
+        total_score = sum(value for value in raw_scores.values() if math.isfinite(float(value)))
+        if total_score > 0:
+            optimized_strategy_weights = {
+                strategy_name: float(score / total_score)
+                for strategy_name, score in raw_scores.items()
+            }
+        elif raw_scores:
+            equal_weight = 1.0 / len(raw_scores)
+            optimized_strategy_weights = {
+                strategy_name: float(equal_weight)
+                for strategy_name in raw_scores
+            }
+
+        for strategy_name, metrics in strategy_performance.items():
+            metrics["weight"] = float(optimized_strategy_weights.get(strategy_name, 0.0) or 0.0)
+
+        weights_changed = any(
+            abs(float(optimized_strategy_weights.get(name, 0.0) or 0.0) - float(current_strategy_weights.get(name, 0.0) or 0.0)) > 1e-6
+            for name in sorted({*optimized_strategy_weights.keys(), *current_strategy_weights.keys()})
+        )
+        if weights_changed:
+            changes.append(
+                {
+                    "change_type": "strategy_weights",
+                    "from_weights": {name: float(current_strategy_weights.get(name, 0.0) or 0.0) for name in sorted(current_strategy_weights)},
+                    "to_weights": {name: float(optimized_strategy_weights.get(name, 0.0) or 0.0) for name in sorted(optimized_strategy_weights)},
+                    "reason": "nightly backtests updated dynamic strategy weights for the A-share strategy pool",
+                    "symbols_analyzed": list(strategy_backtests_by_symbol.keys()),
+                }
+            )
+            if not dry_run:
+                rules.setdefault("strategy", {})["strategy_weights"] = {
+                    name: float(value)
+                    for name, value in optimized_strategy_weights.items()
+                }
+
     rules_path = get_rules_path(payload)
     if changes and not dry_run:
         save_rules(rules, rules_path)
+    if strategy_performance and not dry_run:
+        update_strategy_performance_state(rules, strategy_performance, optimized_strategy_weights)
 
     executed_total = sum(int(stats["executed_trades"]) for stats in stats_by_symbol.values())
     pnl_sample_total = sum(int(stats["pnl_samples"]) for stats in stats_by_symbol.values())
@@ -4623,6 +6964,7 @@ def action_optimize_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
         "generated_at": now_local(rules).isoformat(),
         "enabled": True,
         "dry_run": dry_run,
+        "requested_markets": requested_markets,
         "changed": bool(changes),
         "changes": changes,
         "summary": {
@@ -4631,8 +6973,28 @@ def action_optimize_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
             "pnl_samples": pnl_sample_total,
             "lookback_events": lookback_events,
             "lookback_days": lookback_days,
+            "strategy_backtest_symbols": len(strategy_backtests_by_symbol),
         },
         "stats_by_symbol": stats_by_symbol,
+        "strategy_backtests_by_symbol": {
+            symbol: {
+                strategy_name: sanitize_strategy_backtest(metrics)
+                for strategy_name, metrics in per_strategy.items()
+            }
+            for symbol, per_strategy in strategy_backtests_by_symbol.items()
+        },
+        "strategy_performance": {
+            strategy_name: sanitize_strategy_backtest(metrics)
+            for strategy_name, metrics in strategy_performance.items()
+        },
+        "strategy_weights_before": {
+            name: float(value)
+            for name, value in sorted(current_strategy_weights.items())
+        },
+        "strategy_weights_after": {
+            name: float(value)
+            for name, value in sorted(optimized_strategy_weights.items())
+        },
         "rules_path": str(rules_path),
     }
     report_path = write_optimization_report(report, rules, root_cfg)
@@ -4648,6 +7010,11 @@ def action_optimize_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
                     f"{change['symbol']}: params {change['from_params']} -> {change['to_params']} "
                     f"(ret={float(change.get('backtest_total_return') or 0.0):.4f}, win_rate={float(change.get('backtest_win_rate') or 0.0):.2f})"
                 )
+            elif change.get("change_type") == "strategy_weights":
+                lines.append(
+                    "strategy weights: "
+                    f"{change.get('from_weights')} -> {change.get('to_weights')}"
+                )
             else:
                 lines.append(
                     f"{change['symbol']}: {change['from_order_size']} -> {change['to_order_size']} "
@@ -4660,6 +7027,14 @@ def action_optimize_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
         "changed": bool(changes),
         "changes": changes,
         "stats_by_symbol": stats_by_symbol,
+        "strategy_performance": {
+            strategy_name: sanitize_strategy_backtest(metrics)
+            for strategy_name, metrics in strategy_performance.items()
+        },
+        "strategy_weights": {
+            name: float(value)
+            for name, value in sorted(optimized_strategy_weights.items())
+        },
         "report_path": str(report_path),
         "rules_path": str(rules_path),
         "dry_run": dry_run,
@@ -4675,7 +7050,10 @@ def action_record_trading_decision(payload: Dict[str, Any]) -> Dict[str, Any]:
         "timestamp": now_local(rules).isoformat(),
         "status": status,
         "symbol": payload.get("symbol"),
+        "market": payload.get("market"),
         "side": payload.get("side"),
+        "strategy_name": str(payload.get("strategy_name") or payload.get("strategy") or ""),
+        "strategy_kind": normalize_strategy_kind(payload.get("strategy_kind") or payload.get("strategy_name") or payload.get("strategy")),
         "message": payload.get("message", ""),
         "details": payload.get("details", {}),
     }
@@ -4731,7 +7109,17 @@ def action_record_trading_decision(payload: Dict[str, Any]) -> Dict[str, Any]:
 def action_reconcile_approvals(payload: Dict[str, Any]) -> Dict[str, Any]:
     rules = load_rules(payload)
     root_cfg = load_root_config()
+    manual_approval = bool(root_cfg.get("gatekeeper", {}).get("manual_approval", False))
     recovery_cfg = approval_recovery_config(root_cfg)
+    return {
+        "ok": True,
+        "recovery_enabled": False,
+        "manual_approval": manual_approval,
+        "scanned": 0,
+        "recovered": 0,
+        "results": [],
+        "message": "Manual approval recovery is disabled in the Discord-only runtime",
+    }
     if not recovery_cfg["enabled"]:
         return {
             "ok": True,
@@ -4746,7 +7134,7 @@ def action_reconcile_approvals(payload: Dict[str, Any]) -> Dict[str, Any]:
     max_age_minutes = int(payload.get("max_age_minutes", recovery_cfg["max_age_minutes"]))
     cutoff_local = now_local(rules) - timedelta(minutes=max_age_minutes)
     stale_before = now_local(rules) - timedelta(seconds=timeout_seconds + grace_seconds)
-    approver_targets = collect_feishu_targets(root_cfg.get("gatekeeper", {}))
+    approver_targets: List[str] = []
 
     results: List[Dict[str, Any]] = []
     scanned = 0
@@ -4762,11 +7150,7 @@ def action_reconcile_approvals(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         scanned += 1
-        decision, reply_text = find_feishu_reply(
-            request_id,
-            approver_targets,
-            created_at.astimezone(timezone.utc),
-        )
+        decision, reply_text = (None, "")
         order_payload = approval_record_to_payload(record, rules_file=payload.get("rules_file", ""))
 
         if decision is True:
@@ -4846,6 +7230,7 @@ def action_reconcile_approvals(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 ACTIONS = {
+    "probe_gm_account": action_probe_gm_account,
     "get_portfolio_snapshot": action_get_portfolio_snapshot,
     "get_trading_state": action_get_trading_state,
     "get_review_universe": action_get_review_universe,
@@ -4856,6 +7241,11 @@ ACTIONS = {
     "get_market_data": action_get_market_data,
     "calculate_indicator": action_calculate_indicator,
     "generate_signal": action_generate_signal,
+    "run_market_review_once": action_run_market_review_once,
+    "backtest_strategy": action_backtest_strategy,
+    "start_strategy_simulation": action_start_strategy_simulation,
+    "get_strategy_simulation_status": action_get_strategy_simulation_status,
+    "stop_strategy_simulation": action_stop_strategy_simulation,
     "check_risk": action_check_risk,
     "place_order": action_place_order,
     "reconcile_approvals": action_reconcile_approvals,

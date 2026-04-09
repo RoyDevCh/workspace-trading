@@ -1,69 +1,177 @@
 meta:
-  timezone: "Asia/Shanghai"
-
+  timezone: Asia/Shanghai
 agent:
-  interval_minutes: 5
+  core_symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - '510300'
+  - '159915'
   symbols:
-    - "BTC/USDT"
-    - "ETH/USDT"
+  - BTC/USDT
+  - ETH/USDT
+  - '300308'
+  - '300502'
+  - '603986'
   review_markets:
-    - "crypto"
-    - "cn_equity"
+  - crypto
+  - cn_equity
   auto_execution_markets:
-    - "crypto"
-    - "cn_equity"
+  - crypto
+  - cn_equity
+  watchlists:
+    crypto:
+    - BTC/USDT
+    - ETH/USDT
+    cn_equity:
+    - '510300'
+    - '159915'
+    - '300308'
+    - '300502'
+    - '603986'
+    futures:
+    - BTC/USDT
+    - ETH/USDT
   symbol_groups:
     crypto:
-      - "BTC/USDT"
-      - "ETH/USDT"
+    - BTC/USDT
+    - ETH/USDT
     cn_equity:
-      - "510300"
-      - "159915"
+    - '510300'
+    - '159915'
+    - '300308'
+    - '300502'
+    - '603986'
     futures:
-      - "BTC/USDT"
-      - "ETH/USDT"
+    - BTC/USDT
+    - ETH/USDT
   market_settings:
     crypto:
-      timeframe: "1h"
+      timeframe: 1h
       lookback: 100
-      source: "ccxt"
+      source: ccxt
     cn_equity:
-      timeframe: "1d"
+      timeframe: 1d
       lookback: 120
-      source: "auto"
+      source: auto
     futures:
-      timeframe: "1h"
+      timeframe: 1h
       lookback: 120
-      source: "ccxt"
-
+      source: ccxt
+  dynamic_assets:
+    '300308':
+      symbol: '300308'
+      market: cn_equity
+      status: active
+      source: auto_discover
+      added_at: '2026-04-08T11:03:21.497227+08:00'
+      last_discovered_at: '2026-04-08T11:03:21.497227+08:00'
+      strategy: dynamic
+      position_scale: 0.3
+      selection:
+        symbol: '300308'
+        market: cn_equity
+        name: "\u4E2D\u9645\u65ED\u521B"
+        last: 663.01
+        amount: 15183208155.0
+        turnover_pct: null
+    '300502':
+      symbol: '300502'
+      market: cn_equity
+      status: active
+      source: auto_discover
+      added_at: '2026-04-08T11:03:21.497227+08:00'
+      last_discovered_at: '2026-04-08T11:03:21.497227+08:00'
+      strategy: dynamic
+      position_scale: 0.3
+      selection:
+        symbol: '300502'
+        market: cn_equity
+        name: "\u65B0\u6613\u76DB"
+        last: 486.46
+        amount: 12500418639.0
+        turnover_pct: null
+    '603986':
+      symbol: '603986'
+      market: cn_equity
+      status: active
+      source: auto_discover
+      added_at: '2026-04-08T11:03:21.497227+08:00'
+      last_discovered_at: '2026-04-08T11:03:21.497227+08:00'
+      strategy: dynamic
+      position_scale: 0.3
+      selection:
+        symbol: '603986'
+        market: cn_equity
+        name: "\u5146\u6613\u521B\u65B0"
+        last: 245.3
+        amount: 11292297137.0
+        turnover_pct: null
+  interval_minutes: 5
+  data_source: ccxt
+  timeframe: 1h
+  lookback: 100
 strategy:
-  default_strategy: "combined"
+  default_strategy: dynamic
+  strategy_weights:
+    trend_following: 0.0
+    mean_reversion: 0.545258852813846
+    breakout: 0.45474114718615394
   definitions:
+    dynamic:
+      name: dynamic
+      kind: dynamic
+      enabled_strategies:
+      - trend_following
+      - mean_reversion
+      - breakout
+      sell_all_on_exit: true
+      order_size:
+        default: 0.001
     trend_following:
-      name: "trend_following"
-      kind: "trend_following"
+      name: trend_following
+      kind: trend_following
+      fast: 5
+      slow: 20
       ema_fast_period: 5
       ema_slow_period: 20
       rsi_period: 14
       buy_rsi_below: 70
       sell_rsi_above: 85
+      rsi_oversold: 70
+      rsi_overbought: 85
+      atr_period: 14
+      atr_multiplier: 2.0
+      use_trend_filter: true
+      trend_ema_period: 200
+      trend_filter_ema_period: 200
       sell_all_on_exit: true
       order_size:
         default: 0.001
     combined:
-      name: "combined"
-      kind: "combined"
+      name: combined
+      kind: combined
       fast: 5
       slow: 20
       rsi_period: 14
       rsi_upper: 70
       rsi_lower: 30
+      atr_period: 14
+      atr_multiplier: 2.0
+      volume_multiplier: 1.5
+      volume_lookback: 20
+      trend_filter_ema_period: 200
+      higher_timeframe: 4h
+      higher_timeframe_ema_period: 50
+      higher_timeframe_lookback: 120
+      use_4h_filter: true
+      move_stop_to_entry_on_profit: true
+      breakeven_trigger_pct: 0.03
       sell_all_on_exit: true
       order_size:
         default: 0.001
     mean_reversion:
-      name: "mean_reversion"
-      kind: "mean_reversion"
+      name: mean_reversion
+      kind: mean_reversion
       bb_period: 20
       bb_stddev: 2.0
       rsi_period: 14
@@ -74,58 +182,131 @@ strategy:
       sell_all_on_exit: true
       order_size:
         default: 0.05
+      bb_std: 2.0
+      rsi_oversold: 38
+      rsi_overbought: 68
+    breakout:
+      name: breakout
+      kind: breakout
+      lookback_high: 20
+      lookback_low: 10
+      atr_period: 14
+      atr_stop_multiplier: 2.0
+      sell_all_on_exit: true
+      order_size:
+        default: 0.05
   market_overrides:
     cn_equity:
-      strategy: "trend_following"
-      ema_fast_period: 8
-      ema_slow_period: 21
-      rsi_period: 14
-      buy_rsi_below: 68
-      sell_rsi_above: 82
+      strategy: dynamic
       order_size:
         default: 100
   symbol_overrides:
     BTC/USDT:
-      strategy: "combined"
+      strategy: combined
       fast: 5
       slow: 20
       rsi_period: 14
       rsi_upper: 70
       rsi_lower: 30
+      atr_period: 14
+      atr_multiplier: 2.0
+      volume_multiplier: 1.5
+      volume_lookback: 20
+      trend_filter_ema_period: 200
+      higher_timeframe: 4h
+      higher_timeframe_ema_period: 50
+      higher_timeframe_lookback: 120
+      use_4h_filter: true
       position_scale: 1.0
       order_size:
         default: 0.01
         per_symbol:
           BTC/USDT: 0.01
+      move_stop_to_entry_on_profit: true
+      breakeven_trigger_pct: 0.03
     ETH/USDT:
-      strategy: "combined"
-      fast: 5
-      slow: 20
+      strategy: combined
+      fast: 8
+      slow: 15
       rsi_period: 14
-      rsi_upper: 70
+      rsi_upper: 70.0
       rsi_lower: 30
+      atr_period: 14
+      atr_multiplier: 2.0
+      volume_multiplier: 1.5
+      volume_lookback: 20
+      trend_filter_ema_period: 200
+      higher_timeframe: 4h
+      higher_timeframe_ema_period: 50
+      higher_timeframe_lookback: 120
+      use_4h_filter: true
       position_scale: 0.8
       order_size:
         default: 0.1
         per_symbol:
           ETH/USDT: 0.1
-    "510300":
-      strategy: "trend_following"
-      ema_fast_period: 8
-      ema_slow_period: 21
+      move_stop_to_entry_on_profit: true
+      breakeven_trigger_pct: 0.03
+    '510300':
+      strategy: dynamic
       order_size:
         default: 200
         per_symbol:
-          "510300": 200
-    "159915":
-      strategy: "trend_following"
-      ema_fast_period: 8
-      ema_slow_period: 21
+          '510300': 200
+    '159915':
+      strategy: dynamic
       order_size:
         default: 200
         per_symbol:
-          "159915": 200
-
+          '159915': 200
+    '300308':
+      strategy: dynamic
+      ema_fast_period: 8
+      ema_slow_period: 21
+      rsi_period: 14
+      buy_rsi_below: 68.0
+      sell_rsi_above: 82.0
+      use_higher_timeframe_filter: true
+      higher_timeframe: 1wk
+      higher_timeframe_ema_period: 13
+      higher_timeframe_lookback: 80
+      position_scale: 0.3
+      order_size:
+        default: 100
+        per_symbol:
+          '300308': 100
+    '300502':
+      strategy: dynamic
+      ema_fast_period: 8
+      ema_slow_period: 21
+      rsi_period: 14
+      buy_rsi_below: 68.0
+      sell_rsi_above: 82.0
+      use_higher_timeframe_filter: true
+      higher_timeframe: 1wk
+      higher_timeframe_ema_period: 13
+      higher_timeframe_lookback: 80
+      position_scale: 0.3
+      order_size:
+        default: 100
+        per_symbol:
+          '300502': 100
+    '603986':
+      strategy: dynamic
+      ema_fast_period: 8
+      ema_slow_period: 21
+      rsi_period: 14
+      buy_rsi_below: 68.0
+      sell_rsi_above: 82.0
+      use_higher_timeframe_filter: true
+      higher_timeframe: 1wk
+      higher_timeframe_ema_period: 13
+      higher_timeframe_lookback: 80
+      position_scale: 0.3
+      order_size:
+        default: 100
+        per_symbol:
+          '603986': 100
 risk:
   max_single_loss_pct: 0.02
   max_daily_loss_pct: 0.05
@@ -133,13 +314,12 @@ risk:
   max_order_value_usdt: 50000
   max_position_value_usdt: 100000
   max_daily_notional_usdt: 200000
-  min_cash_ratio: 0.10
+  min_cash_ratio: 0.1
   consecutive_failures_to_pause: 3
   pause_minutes_after_failures: 30
-
 account:
-  execution_mode: "ccxt"
-  exchange: "binance"
+  execution_mode: ccxt
+  exchange: binance
   testnet: true
   assumed_equity_usdt: 10000
   assumed_equity_by_market:
@@ -147,42 +327,44 @@ account:
     cn_equity: 100000
     futures: 10000
   market_modes:
-    crypto: "ccxt"
-    cn_equity: "ths_bridge"
-    futures: "ccxt_futures"
-
+    crypto: ccxt_futures
+    cn_equity: gmtrade
+    futures: ccxt_futures
 macro:
-  state_file: "C:/Users/Roy/.openclaw/workspace-trading/runtime/macro_state.json"
+  state_file: C:/Users/Roy/.openclaw/workspace-trading/runtime/macro_state.json
   refresh_interval_minutes: 15
+  crypto_source: ccxt
+  crypto_symbol: BTC/USDT
+  crypto_interval: 1d
+  cn_equity_source: auto
+  cn_equity_symbol: '510300'
+  cn_equity_interval: 1d
   lookback: 120
   volatility_window: 20
   high_vol_percentile: 0.8
   position_scale_reduction_on_high_vol: 0.5
-  crypto_symbol: "BTC/USDT"
-  crypto_source: "ccxt"
-  crypto_interval: "1d"
-  cn_equity_symbol: "510300"
-  cn_equity_source: "auto"
-  cn_equity_interval: "1d"
-
 market_sessions:
   cn_equity:
     enabled: true
-    timezone: "Asia/Shanghai"
-    trading_days: ["mon", "tue", "wed", "thu", "fri"]
+    timezone: Asia/Shanghai
+    trading_days:
+    - mon
+    - tue
+    - wed
+    - thu
+    - fri
     holidays: []
     extra_trading_days: []
     sessions:
-      - name: "morning"
-        start: "09:30"
-        end: "11:30"
-      - name: "afternoon"
-        start: "13:00"
-        end: "15:00"
-
+    - name: morning
+      start: 09:30
+      end: '11:30'
+    - name: afternoon
+      start: '13:00'
+      end: '15:00'
 optimization:
   enabled: true
-  report_file: "C:/Users/Roy/.openclaw/workspace-trading/runtime/strategy_report.json"
+  report_file: C:/Users/Roy/.openclaw/workspace-trading/runtime/strategy_report.json
   lookback_events: 200
   lookback_days: 30
   min_executed_trades: 3
@@ -199,7 +381,62 @@ optimization:
   max_order_size_cap:
     crypto: 0.05
     cn_equity: 5000
-
+auto_discover:
+  enabled: true
+  max_total_symbols: 15
+  cleanup_on_discovery: true
+  crypto:
+    enabled: false
+    min_volume_usdt: 1000
+    min_price: 0.01
+    min_volatility_pct: 3
+    max_new_per_scan: 3
+    max_inactive_days: 7
+    max_drawdown_pct: 0.15
+    strategy: combined
+    position_scale: 0.2
+    order_size_default: 0.001
+    error_lookback_hours: 48
+    remove_after_error_count: 2
+    atr_period: 14
+    atr_multiplier: 2.0
+    volume_multiplier: 1.5
+    volume_lookback: 20
+    trend_filter_ema_period: 200
+    higher_timeframe: 4h
+    higher_timeframe_ema_period: 50
+    higher_timeframe_lookback: 120
+    use_4h_filter: true
+    move_stop_to_entry_on_profit: true
+    breakeven_trigger_pct: 0.03
+  cn_equity:
+    enabled: true
+    min_amount: 100000000
+    min_turnover: 2.0
+    min_price: 1.0
+    fallback_min_change_pct: 1.0
+    max_new_per_scan: 3
+    max_inactive_trading_days: 10
+    max_drawdown_pct: 0.1
+    strategy: dynamic
+    position_scale: 0.3
+    order_size_default: 100
+    candidate_universe:
+    - '510300'
+    - '159915'
+    - '510050'
+    - '588000'
+    - '512100'
+    - '159949'
+    - '600519'
+    - 000858
+    - '601318'
+    - '300750'
+    - '600036'
+    - '000001'
+    error_lookback_hours: 48
+    remove_after_error_count: 2
+    max_volatility_percentile: 0.8
 logging:
-  decision_log: "C:/Users/Roy/.openclaw/workspace-trading/logs/trading_decisions.jsonl"
-  state_file: "C:/Users/Roy/.openclaw/workspace-trading/runtime/trading_state.json"
+  decision_log: C:/Users/Roy/.openclaw/workspace-trading/logs/trading_decisions.jsonl
+  state_file: C:/Users/Roy/.openclaw/workspace-trading/runtime/trading_state.json

@@ -634,37 +634,56 @@ class GmTradeProvider(ExecutionProvider):
         self.connected = False
 
     def connect(self) -> bool:
+        # Try gmtrade.api first, fall back to gm.api (both provide trading functions)
+        gm = None
+        api_source = None
         try:
             import gmtrade.api as gm  # type: ignore
+            api_source = "gmtrade"
+        except ImportError:
+            try:
+                import gm.api as gm  # type: ignore
+                api_source = "gm"
+            except ImportError:
+                logger.error("Please install gmtrade or gm: pip install gmtrade / pip install gm")
+                raise
 
+        try:
             if not self.token:
-                logger.error("gmtrade token is missing")
+                logger.error("gm token is missing")
                 return False
             if not (self.account_id or self.account_alias):
-                logger.error("gmtrade account_id/account_alias is missing")
+                logger.error("gm account_id/account_alias is missing")
                 return False
 
             gm.set_token(self.token)
-            if self.endpoint:
-                gm.set_endpoint(self.endpoint)
+            if self.endpoint and hasattr(gm, "set_endpoint"):
+                try:
+                    gm.set_endpoint(self.endpoint)
+                except Exception:
+                    pass  # gm.api may not support set_endpoint
 
-            account_kwargs: Dict[str, str] = {}
-            if self.account_id:
-                account_kwargs["account_id"] = self.account_id
-            if self.account_alias:
-                account_kwargs["account_alias"] = self.account_alias
+            # gmtrade uses gm.account() + gm.login(), gm.api uses set_account_id()
+            if api_source == "gmtrade":
+                account_kwargs: Dict[str, str] = {}
+                if self.account_id:
+                    account_kwargs["account_id"] = self.account_id
+                if self.account_alias:
+                    account_kwargs["account_alias"] = self.account_alias
+                self.account = gm.account(**account_kwargs)
+                gm.login(self.account)
+            else:
+                # gm.api: use set_account_id for live trading
+                if hasattr(gm, "set_account_id"):
+                    gm.set_account_id(self.account_id)
+                self.account = self.account_id  # Store as string for gm.api
 
-            self.account = gm.account(**account_kwargs)
-            gm.login(self.account)
             self.gm = gm
             self.connected = True
-            logger.info("Connected to gmtrade account %s", self.account_id or self.account_alias)
+            logger.info("Connected to %s account %s (api=%s)", api_source, self.account_id or self.account_alias, api_source)
             return True
-        except ImportError:
-            logger.error("Please install gmtrade: pip install gmtrade")
-            raise
         except Exception as e:
-            logger.error(f"Failed to connect gmtrade account: {e}")
+            logger.error(f"Failed to connect gm account ({api_source}): {e}")
             self.connected = False
             return False
 
@@ -725,10 +744,15 @@ class GmTradeProvider(ExecutionProvider):
         if not self.connected or self.gm is None:
             return False
         try:
-            self._call_with_optional_account(
-                "order_cancel",
-                wait_cancel_orders=[{"cl_ord_id": str(order_id)}],
-            )
+            # Try order_cancel first (gmtrade), then order_cancel_all (gm.api)
+            try:
+                self._call_with_optional_account(
+                    "order_cancel",
+                    wait_cancel_orders=[{"cl_ord_id": str(order_id)}],
+                )
+            except (TypeError, AttributeError):
+                # gm.api doesn't have order_cancel, try order_cancel_all as fallback
+                self._call_with_optional_account("order_cancel_all")
             return True
         except Exception as e:
             logger.error(f"gmtrade cancel order failed: {e}")
@@ -755,7 +779,18 @@ class GmTradeProvider(ExecutionProvider):
         if not self.connected or self.gm is None:
             return []
         try:
-            rows = self._call_with_optional_account("get_positions") or []
+            # gmtrade uses get_positions (plural), gm.api uses get_position (singular)
+            rows = []
+            for method_name in ("get_positions", "get_position"):
+                if not hasattr(self.gm, method_name):
+                    continue
+                try:
+                    result = self._call_with_optional_account(method_name)
+                    if result:
+                        rows = result if isinstance(result, list) else [result]
+                        break
+                except Exception:
+                    continue
             positions: List[Position] = []
             for item in rows:
                 volume = float(self._gm_attr(item, "volume", default=0) or 0)
@@ -779,8 +814,17 @@ class GmTradeProvider(ExecutionProvider):
         if not self.connected or self.gm is None:
             return {"cash": 0, "total_asset": 0, "market_value": 0, "pnl": 0}
         try:
-            cash_rows = self._call_with_optional_account("get_cash") or []
-            cash = cash_rows[0] if isinstance(cash_rows, list) and cash_rows else cash_rows
+            cash_rows = self._call_with_optional_account("get_cash")
+            # gmtrade returns list of dicts, gm.api returns dict directly
+            if isinstance(cash_rows, list) and cash_rows:
+                cash = cash_rows[0]
+            elif isinstance(cash_rows, dict):
+                cash = cash_rows
+            elif hasattr(cash_rows, '__dict__'):
+                # gm.api may return an object with attributes
+                cash = {k: getattr(cash_rows, k, 0) for k in ('nav', 'available', 'pnl', 'fpnl', 'frozen', 'order_frozen', 'market_value', 'balance')}
+            else:
+                cash = cash_rows or {}
             total_asset = float(self._gm_attr(cash, "nav", default=0) or 0)
             available = float(self._gm_attr(cash, "available", default=0) or 0)
             pnl = float(self._gm_attr(cash, "pnl", default=0) or 0)
@@ -799,11 +843,36 @@ class GmTradeProvider(ExecutionProvider):
             return {"cash": 0, "total_asset": 0, "market_value": 0, "pnl": 0}
 
     def _call_with_optional_account(self, method_name: str, **kwargs: Any) -> Any:
-        method = getattr(self.gm, method_name)
+        method = getattr(self.gm, method_name, None)
+        if method is None:
+            raise AttributeError(f"gm module has no attribute '{method_name}'")
+        # Try different calling patterns:
+        # 1. gmtrade: account=<account_object>
+        # 2. gm.api: account_id=<string>
+        # 3. No account param (set_account_id already called, or function doesn't need it)
+        call_attempts = []
+        if not isinstance(self.account, str):
+            # gmtrade: account is an object
+            call_attempts.append({"account": self.account, **kwargs})
+        if isinstance(self.account, str) and self.account:
+            # gm.api: account_id is a string
+            call_attempts.append({"account_id": self.account, **kwargs})
+        # Always try without account param as fallback
+        call_attempts.append(kwargs)
+        
+        last_error = None
+        for attempt_kwargs in call_attempts:
+            try:
+                return method(**attempt_kwargs)
+            except (TypeError, AttributeError) as e:
+                last_error = e
+                continue
+        
+        # Last resort: call with no args
         try:
-            return method(account=self.account, **kwargs)
+            return method()
         except TypeError:
-            return method(**kwargs)
+            raise last_error or TypeError(f"Cannot call {method_name} with any known signature")
 
     def _gm_attr(self, raw: Any, *names: str, default: Any = None) -> Any:
         for name in names:
