@@ -31,11 +31,8 @@ LONG_SLEEP_AFTER_MAX_FAILS = 300  # 5 min pause after too many fails
 HEARTBEAT_TIMEOUT = 60          # seconds without ACK = connection dead
 # ──────────────────────────────────────────────────────────────────
 
-BOT_TOKEN = os.environ.get(
-    "DISCORD_BOT_TOKEN",
-    "<DISCORD_BOT_TOKEN>",
-)
-CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "<DISCORD_CHANNEL_ID>")
+BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 PROXY_URL = (
     os.environ.get("HTTP_PROXY")
     or os.environ.get("HTTPS_PROXY")
