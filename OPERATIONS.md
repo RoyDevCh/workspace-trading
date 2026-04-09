@@ -76,6 +76,15 @@ Current strategy performance (as of 2026-04-08):
 | mean_reversion | +62.9% | 80% | 11.2% |
 | trend_following | -13.2% | 33% | 0% (eliminated) |
 
+Kernel modules (extracted 2026-04-09):
+
+- `kernel/decision.py` — `OrderIntent` dataclass + `make_decision()` pure function
+- `kernel/risk.py` — `RiskResult` dataclass + `check_risk()` pure function
+- `kernel/order_log.py` — Idempotent order logger (dedup by intent_hash)
+- `kernel/indicators.py` — Pure indicator functions
+- `kernel/strategy/` — Strategy evaluation pure functions
+- `tests/` — Unit tests for kernel modules (all passing)
+
 ## Infrastructure (updated 2026-04-08)
 
 Mihomo proxy startup:

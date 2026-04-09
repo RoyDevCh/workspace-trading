@@ -1,6 +1,6 @@
 ﻿# OpenClaw Trading System Development Manual
 
-Last updated: `2026-04-09`
+Last updated: `2026-04-09` (kernel refactor)
 
 Bug fix history is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -70,9 +70,24 @@ As of `2026-04-09`, the system is running:
 
 The local backup at `C:\Users\Roy\.openclaw\workspace-trading\` contains:
 
-- `openclaw_trading_bridge.py` — Main trading bridge (30+ actions)
+- `openclaw_trading_bridge.py` — Main trading bridge (30+ actions, calls kernel modules)
 - `execution/execution.py` — Execution layer (CCXTExecutionProvider, GmTradeProvider, ExecutionManager)
 - `execution/__init__.py` — Package init
+- `kernel/` — **Trading kernel (pure functions, no I/O)** — extracted 2026-04-09
+  - `kernel/__init__.py` — Package init
+  - `kernel/decision.py` — `OrderIntent` dataclass + `make_decision()` pure function
+  - `kernel/risk.py` — `RiskResult` dataclass + `check_risk()` pure function
+  - `kernel/order_log.py` — Idempotent order logger (dedup by intent hash)
+  - `kernel/indicators.py` — Pure indicator functions (EMA, RSI, MACD, Bollinger)
+  - `kernel/strategy/` — Strategy evaluation (pure functions)
+    - `registry.py` — `get_strategy()` dispatcher + `evaluate_trend_following_signal()` + `evaluate_mean_reversion_signal()` + `evaluate_combined_signal()`
+    - `trend_following.py` — Trend-following signal evaluation
+    - `mean_reversion.py` — Mean-reversion signal evaluation
+    - `combined.py` — Combined signal evaluation
+- `tests/` — Unit tests for kernel modules
+  - `test_decision.py` — OrderIntent + make_decision tests
+  - `test_risk.py` — Risk check tests (12 cases)
+  - `test_strategy.py` — Strategy evaluation tests (9 cases)
 - `config.yaml` — System configuration (redact secrets before sharing)
 - `sensory_data_provider.py` — Data provider with SinaRealtimeProvider
 - `discord_agent_bridge.py` — Discord bot bridge
@@ -104,6 +119,8 @@ The live remote deployment target is the Windows host (`10.83.120.248`, SSH port
 | `C:\Users\Roy\.openclaw\workspace\discord_agent_bridge.py` | Discord bridge |
 | `C:\Users\Roy\.openclaw\workspace\discord_bridge_daemon.py` | Discord auto-restart daemon |
 | `C:\Users\Roy\.openclaw\workspace\launch_bridge.bat` | Bridge launcher |
+| `C:\Users\Roy\.openclaw\workspace-trading\kernel\` | Trading kernel (pure functions) |
+| `C:\Users\Roy\.openclaw\workspace-trading\tests\` | Kernel unit tests |
 | `C:\Users\Roy\.openclaw\workspace-trading\*` | Workspace trading files |
 | `C:\Users\Roy\.openclaw\runtime\gm311\` | GM SDK Python 3.11 runtime |
 | `C:\Users\Roy\.openclaw\logs\` | Runtime logs |
@@ -114,7 +131,7 @@ If local and remote files diverge, the remote running copy is the live truth. Sy
 
 ### 4.1 High-level flow
 
-`OpenClaw plugin -> Python trading bridge -> data / indicator / risk / approval / execution -> runtime logs and state`
+`OpenClaw plugin -> Python trading bridge -> kernel (pure decisions) / execution (I/O) -> runtime logs and state`
 
 More concretely:
 
@@ -123,16 +140,63 @@ More concretely:
 3. `openclaw_trading_bridge.py` dispatches the action.
 4. The bridge reads config and rules.
 5. Data comes from `SinaRealtimeProvider` (primary for A-share), `ccxt` (crypto), `akshare`/`yfinance` (fallback).
-6. Risk is checked in the bridge.
-7. Real orders go through gatekeeper approval.
-8. Execution is routed by market:
+6. **Signal generation and risk checks use `kernel/` pure functions** (no I/O, no side effects).
+7. `kernel/decision.py` produces an `OrderIntent` with deterministic hash for idempotency.
+8. `kernel/risk.py` evaluates risk limits and returns `RiskResult(allowed, reasons)`.
+9. `kernel/order_log.py` deduplicates orders by intent hash.
+10. Real orders go through gatekeeper approval.
+11. Execution is routed by market:
    - `crypto -> ccxt_futures / Binance futures testnet (USDT-M perpetual swap)`
    - `cn_equity -> gmtrade / MyQuant simulation`
    - `futures -> ccxt_futures / Binance futures testnet`
-9. Decisions and runtime state are persisted to log/state files.
-10. Notifications go to Discord via `discord_agent_bridge.py`.
+12. Decisions and runtime state are persisted to log/state files.
+13. Notifications go to Discord via `discord_agent_bridge.py`.
 
-### 4.2 OpenClaw knowledge layer
+### 4.2 Kernel architecture (pure functions)
+
+The `kernel/` package is the deterministic core of the trading system. All functions are **pure** (no I/O, no global state mutation, no network calls). This makes them:
+
+- **Unit-testable** without mocks
+- **Replayable** — same inputs always produce same outputs
+- **Composable** — strategies compose via `evaluate_combined_signal()`
+
+Key data classes:
+
+```python
+@dataclass
+class OrderIntent:
+    symbol: str
+    side: str        # "buy" | "sell"
+    order_type: str  # "market" | "limit"
+    quantity: float
+    price: Optional[float] = None
+    stop_price: Optional[float] = None
+    leverage: int = 1
+    strategy: str = ""
+    signal_strength: float = 0.0
+    intent_hash: str = ""  # Deterministic SHA-256 for idempotency
+
+@dataclass
+class RiskResult:
+    allowed: bool
+    reasons: List[str]
+    estimated_loss: Optional[float] = None
+    position_value: Optional[float] = None
+    loss_pct: Optional[float] = None
+```
+
+Decision flow:
+
+```
+market data → indicators (kernel/indicators.py)
+           → strategy evaluate (kernel/strategy/)
+           → OrderIntent (kernel/decision.py)
+           → risk check (kernel/risk.py)
+           → order log dedup (kernel/order_log.py)
+           → execution (execution.py, I/O layer)
+```
+
+### 4.3 OpenClaw knowledge layer
 
 OpenClaw is guided by:
 
@@ -144,7 +208,7 @@ OpenClaw is guided by:
 
 **Important**: When adding new tools or changing behavior, update BOTH the code AND these docs. Otherwise the agent won't use tools correctly.
 
-### 4.3 Scheduler model
+### 4.4 Scheduler model
 
 Trading jobs use `sessionTarget: isolated`.
 
@@ -152,7 +216,7 @@ This is intentional — long-lived sessions accumulate too much context. Isolate
 
 Do **not** casually switch trading jobs back to long-lived interactive sessions.
 
-### 4.4 Data flow for trade queries
+### 4.5 Data flow for trade queries
 
 ```
 User asks "what trades happened"
@@ -162,7 +226,7 @@ User asks "what trades happened"
   -> Returns real data with symbol/qty/price/reason
 ```
 
-### 4.5 Discord bridge architecture (v2)
+### 4.6 Discord bridge architecture (v2)
 
 ```
 Discord user sends message
@@ -194,7 +258,37 @@ Discord user sends message
 - Inject workspace path and rules file
 - Mirror proxy environment variables (HTTP_PROXY / http_proxy)
 
-### 5.2 Bridge layer (`openclaw_trading_bridge.py`)
+### 5.2 Kernel layer (`kernel/`) — Pure functions
+
+The deterministic core. No I/O, no global state, no network calls.
+
+- `kernel/decision.py` — `OrderIntent` dataclass + `make_decision()` pure function
+  - Takes market data + strategy signal + risk result, produces an `OrderIntent`
+  - `intent_hash` is SHA-256 of (symbol, side, quantity, price, stop_price, strategy, timestamp_minute)
+  - Used for idempotent order logging (dedup by hash)
+- `kernel/risk.py` — `RiskResult` dataclass + `check_risk()` pure function
+  - Position size limits, daily budget, max loss, futures stop-price requirement
+  - All parameters passed in explicitly (no global config reads)
+- `kernel/indicators.py` — Pure indicator functions (EMA, RSI, MACD, Bollinger)
+- `kernel/strategy/registry.py` — `get_strategy()` dispatcher + strategy evaluation functions
+  - `evaluate_trend_following_signal()` — MA crossover + ADX + volume confirmation
+  - `evaluate_mean_reversion_signal()` — RSI + Bollinger + Z-score
+  - `evaluate_combined_signal()` — Weighted combination of trend + mean_reversion
+- `kernel/order_log.py` — Idempotent order logger (JSONL, dedup by intent_hash)
+- `tests/` — Unit tests for all kernel modules (test_decision, test_risk, test_strategy)
+
+Design principles:
+
+- **Pure functions only** — no side effects, no I/O, no global state
+- **Explicit inputs** — all data passed as parameters, no hidden config reads
+- **Deterministic** — same inputs always produce same outputs
+- **Testable** — no mocks needed for unit tests
+
+- Expose bridge actions as OpenClaw tools
+- Inject workspace path and rules file
+- Mirror proxy environment variables (HTTP_PROXY / http_proxy)
+
+### 5.3 Bridge layer (`openclaw_trading_bridge.py`)
 
 Key responsibilities:
 
@@ -214,7 +308,7 @@ Key design patterns:
 - `save_state()` — persists runtime state through `to_jsonable()` for encoding safety
 - `send_operator_notification()` sends directly to the configured Discord channel
 
-### 5.3 Execution layer (`execution.py`)
+### 5.4 Execution layer (`execution.py`)
 
 - `CCXTExecutionProvider` — crypto spot + futures execution via ccxt
   - `__init__` params: `exchange_id`, `api_key`, `secret`, `testnet`, `market_type`, etc.
@@ -236,7 +330,7 @@ Key design patterns:
 
 - `ExecutionManager` — routes orders to the correct provider based on `market_modes` config
 
-### 5.4 MyQuant scripted runtime
+### 5.5 MyQuant scripted runtime
 
 Files: `gm_strategy_runtime.py`, `templates/gm_ma_cross_template.py`, `templates/gm_one_shot_order_template.py`, `templates/gm_account_probe_template.py`
 
@@ -245,7 +339,7 @@ Files: `gm_strategy_runtime.py`, `templates/gm_ma_cross_template.py`, `templates
 - Supports backtest, long-running simulation, account probe, and one-shot order submission
 - Uses dedicated Python 3.11 runtime at `C:\Users\Roy\.openclaw\runtime\gm311\Scripts\python.exe`
 
-### 5.5 Sensory layer (`data_provider.py`)
+### 5.6 Sensory layer (`data_provider.py`)
 
 - `SinaRealtimeProvider` — Primary A-share data source (Sina/Tencent realtime API)
 - `AkshareProvider` — Secondary A-share data source
@@ -253,14 +347,14 @@ Files: `gm_strategy_runtime.py`, `templates/gm_ma_cross_template.py`, `templates
 - Bridge `cn_equity` provider chain: `["sina", "akshare", "yfinance"]`
 - Crypto data still via ccxt (mainnet prices)
 
-### 5.6 Approval layer (`gatekeeper.py`)
+### 5.7 Approval layer (`gatekeeper.py`)
 
 - Approval state machine (pending → approved/rejected/expired)
 - Gatekeeper code remains available for future approval work, but manual approval is disabled in the current runtime
 - Operator notifications now go to Discord
 - Stale-approval recovery is disabled in the current runtime
 
-### 5.7 Discord bridge v2 (`discord_agent_bridge.py` + `discord_bridge_daemon.py`)
+### 5.8 Discord bridge v2 (`discord_agent_bridge.py` + `discord_bridge_daemon.py`)
 
 - `discord_agent_bridge.py`: Main bridge process (~713 lines), connects to Discord via bot token
 - `discord_bridge_daemon.py`: Auto-restart wrapper (~91 lines), monitors bridge process with exponential backoff
@@ -513,6 +607,8 @@ Recommended continuation order:
 
 Concrete next code entry points:
 
+- Trading kernel (pure functions): `workspace-trading/kernel/decision.py`, `kernel/risk.py`, `kernel/strategy/`
+- Kernel unit tests: `workspace-trading/tests/test_decision.py`, `tests/test_risk.py`, `tests/test_strategy.py`
 - MyQuant runtime orchestration: `workspace-trading/gm_strategy_runtime.py`
 - MyQuant one-shot/account probe templates: `workspace-trading/templates/gm_one_shot_order_template.py`, `workspace-trading/templates/gm_account_probe_template.py`
 - Execution routing: `execution/execution.py`
