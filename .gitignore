@@ -30,8 +30,30 @@ optimize_dry_run.json
 update_macro_auto.json
 market_*.json
 
+# Test/debug scripts with hardcoded keys
+test_api.py
+test_executor.py
+test_executor2.py
+test_final.py
+test_ths_provider.py
+debug_executor.py
+place_order_minimal.py
+check_env.py
+verify_integration.py
+bridge_smoke.py
+feishu_reply_smoke.py
+actual_order_direct.py
+actual_order_feishu_reply.py
+run_test.py
+
+# Cleanup scripts
+clean_*.py
+clean_*.sh
+remove_*.py
+
 # Large third-party directories
 cryptoclaw/
+TradingView-Claw/
 
 # OS files
 Thumbs.db
